@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from brain import db as dbmod
-from brain import query
+from brain import query, service
 from brain.indexer import index_all
 
 HOME = str(Path.home())
@@ -60,6 +60,11 @@ def main(argv: list[str] | None = None) -> None:
 
     p = sub.add_parser("stats", help="what the index holds")
     p.set_defaults(func=cmd_stats)
+
+    p = sub.add_parser("service", help="run `brain watch` in the background, from login on "
+                       "(launchd on macOS, systemd on Linux and WSL)")
+    p.add_argument("action", choices=["install", "uninstall", "status"])
+    p.set_defaults(func=cmd_service)
 
     args = parser.parse_args(argv)
     try:
@@ -235,3 +240,12 @@ def cmd_stats(args) -> None:
               f"{when(row['first'], '%Y-%m-%d')} → {when(row['last'])}")
     size = sum(p.stat().st_size for p in path.parent.glob(path.name + "*"))
     print(f"index  {tilde(str(path))}  {size / 1e6:.0f} MB")
+
+
+def cmd_service(args) -> None:
+    if args.action == "install":
+        service.install(args.db)
+    elif args.action == "uninstall":
+        service.uninstall()
+    else:
+        service.status()

@@ -6,8 +6,17 @@ for your agents. Everything stays on your machine: one SQLite file, no server, n
 ```sh
 uv tool install --editable ~/brain   # puts `brain` on your PATH
 brain index                          # first run reads every transcript (a few minutes)
-brain watch                          # keep the index current while you work (Ctrl-C to stop)
+brain service install                # keep it current in the background, from every login on
 ```
+
+`brain service install` runs `brain watch` as you, at low priority, restarting it if it stops:
+a launchd agent on macOS (`~/Library/LaunchAgents/local.brain.plist`, log in
+`~/Library/Logs/brain.log`) or a systemd user service on Linux and WSL
+(`~/.config/systemd/user/brain.service`, log in `journalctl --user -u brain`). WSL needs
+systemd turned on in `/etc/wsl.conf`; the command says how if it isn't. `brain service status`
+shows whether it is running and its latest log lines; `brain service uninstall` removes it.
+Agent directories moved with the variables below are carried into the service when it is
+installed. To run it in a terminal instead, use `brain watch`.
 
 ## Searching
 
