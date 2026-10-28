@@ -1,0 +1,6 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+mise.local.toml
+mise.local.lock
