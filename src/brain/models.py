@@ -46,6 +46,25 @@ class Hit:
 
 
 @dataclass(frozen=True, slots=True)
+class Commit:
+    hash: str  # abbreviated, as `git commit` printed it
+    branch: str
+    subject: str
+
+
+@dataclass(frozen=True, slots=True)
+class Brief:
+    """A session in a few lines: what was asked, how it ended and what it changed."""
+    session: Session
+    prompts: int  # how many the user typed
+    last_prompt: str | None
+    outcome: str | None  # the last reply that ended a turn rather than calling tools
+    finished: bool  # false if work carried on after `outcome`: interrupted or still going
+    files: list[str]  # edited or written, most often first; absolute paths
+    commits: list[Commit]  # made with `git commit`, in order
+
+
+@dataclass(frozen=True, slots=True)
 class MessagePage:
     messages: list[Message]
     offset: int  # position of the first in the (filtered) session

@@ -1,4 +1,5 @@
 import ast
+import io
 import json
 import os
 import sqlite3
@@ -7,13 +8,20 @@ import sys
 import tempfile
 import unittest
 from compression import zstd
+from contextlib import redirect_stdout
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 import brain
-from brain import AmbiguousSession, Brain, IndexFormatError, IndexResult, SessionNotFound, query
+from brain import (AmbiguousSession, Brain, Commit, IndexFormatError, IndexResult, SessionNotFound,
+                   project_root, query)
+from brain.cli import main
+
+# The variables an agent session sets, which would change what a brief leaves out.
+AGENT_ENV = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "PI_SESSION_ID", "PI_CODING_AGENT",
+             "CLAUDE_CODE_ENTRYPOINT")
 
 
 def jsonl(*records) -> bytes:
@@ -27,6 +35,13 @@ def claude(uuid, kind, content, ts="2026-10-28T10:00:00Z", **extra):
 
 def codex(ptype, ts="2026-10-28T10:00:00Z", **payload):
     return {"type": "response_item", "timestamp": ts, "payload": {"type": ptype, **payload}}
+
+
+PI_REPLY = {"type": "message", "id": "e1", "timestamp": "2026-10-28T10:00:00Z", "message": {
+    "role": "assistant", "content": [
+        {"type": "thinking", "thinking": "check the size"},
+        {"type": "text", "text": "Resizing it now."},
+        {"type": "toolCall", "name": "bash", "arguments": {"command": "magick hero.png"}}]}}
 
 
 class Fixture(unittest.TestCase):
@@ -44,6 +59,8 @@ class Fixture(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
+        for name in AGENT_ENV:
+            os.environ.pop(name, None)
         self.brain = Brain(self.root / "index.db")
         self.addCleanup(self.brain.close)
         self.db = self.brain.db
@@ -198,6 +215,39 @@ class BrainTest(Fixture):
         hit = self.hits("hero.png")[0]
         self.assertEqual((hit.agent, hit.kind, hit.cwd), ("pi", "tool_call", "/work/site"))
 
+    def test_pi_reply_is_a_message_per_block_and_its_brief_is_not_indexed(self):
+        self.write("pi/sessions/--work-site--/2026-10-28T10-00-00-000Z_p1.jsonl", jsonl(
+            {"type": "session", "id": "p1", "cwd": "/work/site"},
+            {"type": "custom_message", "id": "c1", "timestamp": "2026-10-28T10:00:00Z",
+             "customType": "brain-brief", "content": "Earlier sessions in ~/site", "display": False},
+            PI_REPLY,
+        ))
+        self.brain.index()
+        rows = [tuple(r) for r in self.db.execute("SELECT kind, text FROM messages ORDER BY id")]
+        self.assertEqual(rows, [("thinking", "check the size"), ("text", "Resizing it now."),
+                                ("tool_call", "bash\ncommand: magick hero.png")])
+
+    def test_upgrade_from_format_1_reads_pi_again_unless_its_transcript_is_gone(self):
+        self.write("pi/sessions/--work--/2026-10-28T10-00-00-000Z_p1.jsonl", jsonl(PI_REPLY))
+        gone = self.write("pi/sessions/--work--/2026-10-28T10-00-00-000Z_p2.jsonl", jsonl(PI_REPLY))
+        self.brain.index()
+        # As format 1 left it: a reply is one message, of its first block's kind.
+        self.db.execute("DELETE FROM messages")
+        for sid in ("p1", "p2"):
+            self.db.execute("INSERT INTO messages (agent, session_id, source_id, ts, role, kind, text) "
+                            "VALUES ('pi', ?, 'old', 0, 'assistant', 'thinking', 'all of it')", (sid,))
+        self.db.execute("PRAGMA user_version = 1")
+        gone.unlink()
+        with Brain(self.brain.path, readonly=True) as reader:  # reads it as it is
+            self.assertEqual(len(reader.sessions()), 2)
+        with Brain(self.brain.path) as upgraded:
+            upgraded.index()
+            rows = [tuple(r) for r in upgraded.db.execute(
+                "SELECT session_id, kind FROM messages ORDER BY session_id, id")]
+            self.assertEqual(upgraded.db.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(rows, [("p1", "thinking"), ("p1", "text"), ("p1", "tool_call"),
+                                ("p2", "thinking")])
+
     def test_query_punctuation_is_literal(self):
         self.assertEqual(query.fts_query("git push --force-with-lease"), '"git" "push" "--force-with-lease"')
         self.assertEqual(query.fts_query('"rate limit" deploy*'), '"rate limit" "deploy"*')
@@ -291,6 +341,134 @@ class SdkTest(Fixture):
                          ["agent", "session_id", "parent_id", "cwd", "title", "started_at", "updated_at",
                           "messages", "path"])
         self.assertEqual(list(asdict(self.brain.messages(hit)[0])), ["id", "ts", "role", "kind", "text"])
+
+
+class BriefTest(Fixture):
+    """`brain brief`: the latest sessions in a project, for an agent starting work there."""
+
+    def setUp(self):
+        super().setUp()
+        self.proj = self.root.resolve() / "proj"
+        (self.proj / ".git").mkdir(parents=True)
+        self.wt = self.proj / ".claude" / "worktrees" / "wt"
+        self.wt.mkdir(parents=True)
+        (self.wt / ".git").write_text(f"gitdir: {self.proj}/.git/worktrees/wt\n")
+        edit = lambda path: {"type": "tool_use", "name": "Edit",
+                             "input": {"file_path": str(path), "old_string": "a", "new_string": "b"}}
+        bash = lambda cmd: {"type": "tool_use", "name": "Bash", "input": {"command": cmd}}
+        result = lambda out: ("user", [{"type": "tool_result", "content": out}])
+        self.session("s-other", self.root.resolve() / "elsewhere", 0, ("user", "other work"),
+                     ("assistant", "Done elsewhere."))
+        self.session("s-old", self.proj, 1, ("user", "add the parser"),
+                     ("assistant", [edit(self.proj / "src" / "parse.py")]), result("ok"),
+                     ("assistant", [bash('git add -A && git commit -q -m "Add the parser"')]),
+                     result(""), ("assistant", [bash("git log --oneline -1")]),
+                     result("abc1234 Add the parser"), ("assistant", "The parser is in."))
+        self.session("s-gone", self.root.resolve() / "old" / "proj", 2, ("user", "start the project"),
+                     ("assistant", "Started."))
+        self.session("s-wt", self.wt, 3, ("user", "first try"), ("assistant", "Tried."),
+                     ("user", "[Request interrupted by user]"), ("user", "now the lexer"),
+                     ("assistant", "Half done."), ("assistant", [edit(self.wt / "lex.py")]))
+        sid = "01a1660f-8cda-7791-a841-fb4a30195445"
+        self.write(f"codex/sessions/2026/10/28/rollout-2026-10-28T10-04-00-{sid}.jsonl", jsonl(
+            {"type": "session_meta", "payload": {"id": sid, "cwd": str(self.proj)}},
+            codex("message", ts="2026-10-28T10:04:00Z", role="user",
+                  content=[{"type": "input_text", "text": "add the API"}]),
+            codex("custom_tool_call", ts="2026-10-28T10:04:01Z", name="apply_patch",
+                  input="*** Begin Patch\n*** Add File: src/api.rs\n+fn main() {}\n*** End Patch"),
+            codex("function_call_output", ts="2026-10-28T10:04:02Z",
+                  output="[main 1a2b3c4] Add the API\n 1 file changed, 1 insertion(+)"),
+            codex("message", ts="2026-10-28T10:04:03Z", role="assistant",
+                  content=[{"type": "output_text", "text": "Added the API."}]),
+        ))
+        self.codex_id = sid
+        self.session("s-rerun-1", self.proj, 5, ("user", "nightly check"), ("assistant", "Fine."))
+        self.session("s-rerun-2", self.proj, 6, ("user", "nightly check"), ("assistant", "Still fine."))
+        self.session("s-empty", self.proj, 7, ("user", "Hi"))
+        self.session("s-mirror", self.proj, 8, ("user", "from pi"), ("assistant", [
+            {"type": "tool_use", "name": "mcp__custom-tools__bash", "input": {"command": "ls"}}]),
+            ("assistant", "Listed."))
+        self.session("s-current", self.proj, 9, ("user", "what happened here?"), ("assistant", "Lots."))
+        self.brain.index()
+        os.environ["CLAUDE_CODE_SESSION_ID"] = "s-current"
+
+    def session(self, sid, cwd, minute, *records):
+        lines = [claude(f"{sid}-{n}", kind, content, ts=f"2026-10-28T10:0{minute}:{n:02}Z", cwd=str(cwd))
+                 for n, (kind, content) in enumerate(records)]
+        self.write(f"claude/projects/x/{sid}.jsonl", jsonl(*lines))
+
+    def recent(self, path=None, **kw):
+        with mock.patch("brain.brief.TEMP", ("/nowhere/",)):  # the fixture itself is in one
+            return self.brain.recent_work(path or self.proj, **kw)
+
+    def test_latest_sessions_in_the_project_and_where_it_was(self):
+        ids = [b.session.session_id for b in self.recent(limit=10)]
+        # Not the current session, Claude Code's copy of a Pi one, one with nothing to report,
+        # an earlier run of the same task, or another project's.
+        self.assertEqual(ids, ["s-rerun-2", self.codex_id, "s-wt", "s-gone", "s-old"])
+        self.assertEqual([b.session.session_id for b in self.recent(limit=2)],
+                         ["s-rerun-2", self.codex_id])
+        self.assertEqual(project_root(self.wt / "sub"), self.proj)
+        self.assertEqual([b.session.session_id for b in self.recent(self.wt, limit=10)], ids)
+        self.assertEqual(len(self.recent(limit=10, exclude=["s-old"])), 4)
+
+    def test_brief_tells_what_was_asked_how_it_ended_and_what_changed(self):
+        old, wt, api = (self.brain.brief(ref) for ref in ("s-old", "s-wt", self.codex_id))
+        self.assertEqual((old.prompts, old.last_prompt, old.outcome, old.finished),
+                         (1, "add the parser", "The parser is in.", True))
+        self.assertEqual(old.files, [str(self.proj / "src" / "parse.py")])
+        self.assertEqual(old.commits, [Commit("abc1234", "", "Add the parser")])
+        # Interrupted mid-turn: "Half done." led to a tool call, so the outcome is the reply that
+        # ended the turn before.
+        self.assertEqual((wt.prompts, wt.last_prompt, wt.outcome, wt.finished),
+                         (2, "now the lexer", "Tried.", False))
+        self.assertEqual((api.files, api.commits),
+                         ([str(self.proj / "src" / "api.rs")], [Commit("1a2b3c4", "main", "Add the API")]))
+        self.assertEqual(list(asdict(old)), ["session", "prompts", "last_prompt", "outcome",
+                                             "finished", "files", "commits"])
+
+    def test_commits_are_those_the_repository_has(self):
+        repo = self.root.resolve() / "repo"
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,
+                                        check=True).stdout
+        repo.mkdir()
+        git("init", "-q")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "Real")
+        real = git("rev-parse", "--short", "HEAD").strip()
+        # Commit lines from another repository, as when searching old transcripts, don't count.
+        self.session("s-repo", repo, 0, ("user", "commit it"), ("assistant", [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "git commit -am Real"}}]),
+            ("user", [{"type": "tool_result", "content": f"[main {real}] Real\n 1 file changed\n"
+                                                      "[main 0123abc] Elsewhere\n 2 files changed"}]),
+            ("assistant", "Committed."))
+        self.brain.index()
+        self.assertEqual(self.brain.brief("s-repo").commits, [Commit(real, "main", "Real")])
+
+    def run_cli(self, *args, stdin=""):
+        out = io.StringIO()
+        with (mock.patch("brain.brief.TEMP", ("/nowhere/",)), mock.patch("sys.stdin", io.StringIO(stdin)),
+              redirect_stdout(out)):
+            main(["--db", str(self.brain.path), "brief", *args])
+        return out.getvalue()
+
+    def test_cli_and_hook(self):
+        text = self.run_cli(str(self.proj), "-n", "5")
+        self.assertIn("newest first", text.splitlines()[0])
+        self.assertIn("in .claude/worktrees/wt", text)
+        self.assertIn("which no longer exists", text)
+        self.assertIn("  2 prompts, the last: now the lexer", text)
+        self.assertIn("  unfinished; last turn-ending reply: Tried.", text)
+        self.assertIn("  changed: src/parse.py", text)
+        self.assertIn("  commits: abc1234 Add the parser", text)
+        event = {"session_id": "s-rerun-2", "cwd": str(self.proj), "source": "startup"}
+        hook = self.run_cli("--hook", stdin=json.dumps(event))
+        # The session starting is left out, so the run of its task before it is the latest.
+        self.assertNotIn("Still fine.", hook)
+        self.assertIn("  outcome: Fine.", hook)
+        self.assertEqual(self.run_cli("--hook", stdin=json.dumps({**event, "source": "resume"})), "")
+        self.assertEqual(self.run_cli("--hook", stdin="not json"), "")
+        with mock.patch.dict(os.environ, {"PI_CODING_AGENT": "true"}):  # Pi adds its own
+            self.assertEqual(self.run_cli("--hook", stdin=json.dumps(event)), "")
 
 
 class LayeringTest(unittest.TestCase):

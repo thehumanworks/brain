@@ -2,19 +2,26 @@
 
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from brain import db as dbmod, indexer, query
+from brain import brief as briefmod, db as dbmod, indexer, query
 from brain.errors import AmbiguousSession, SessionNotFound
-from brain.models import AgentStats, Hit, IndexResult, Message, MessagePage, Session, Stats
+from brain.models import (AgentStats, Brief, Hit, IndexResult, Message, MessagePage, Session,
+                          Stats)
 
 # Where a session can be given: a Session, a Hit, or an id as `Brain.session` takes it.
 type SessionRef = Session | Hit | str
 # A point in time: unix ms, a datetime, or `7d`, `12h`, `2w` or an ISO date.
 type Since = int | datetime | str
+
+
+def project_root(path: str | Path = ".") -> Path:
+    """The project `path` is in: the main checkout of its git repository, or `path` itself
+    outside git."""
+    return briefmod.checkout(path)[1]
 
 
 def since_ms(value: Since | None) -> int | None:
@@ -138,6 +145,29 @@ class Brain:
         with self.snapshot():
             return query.page(self.db, agent, session_id, offset, limit, anchor, context,
                               tools, keep)
+
+    def brief(self, session: SessionRef) -> Brief:
+        """A session in a few lines: its prompts, the reply it ended on, and the files it
+        changed and commits it made (that its project's repository has, if it still exists)."""
+        if isinstance(session, Hit):
+            session = self.session(session.session_id)
+        elif isinstance(session, str):
+            session = self.session(session)
+        repo = project_root(session.cwd) if session.cwd and Path(session.cwd).is_dir() else None
+        with self.snapshot():
+            return briefmod.brief(self.db, session, repo)
+
+    def recent_work(self, path: str | Path = ".", *, limit: int = 3,
+                    exclude: Iterable[str | None] = ()) -> list[Brief]:
+        """Briefs of the `limit` latest sessions in `path`'s project (`project_root`), newest
+        first: sessions there or below, such as in worktrees, and in directories of the
+        project's name that no longer exist, where it was before it moved. Left out are
+        subagents, Claude Code's copies of Pi sessions, reruns of a title already listed,
+        sessions with nothing to report, the session this process runs in (as the agent's
+        environment variables tell) and any session id in `exclude`."""
+        exclude = [*exclude, *briefmod.current_sessions()]
+        with self.snapshot():
+            return briefmod.recent(self.db, path, limit, exclude)
 
     def locate(self, session: SessionRef) -> tuple[str, str]:
         if isinstance(session, str):

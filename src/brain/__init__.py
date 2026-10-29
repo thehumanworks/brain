@@ -13,10 +13,11 @@ loads neither the command line nor its terminal UI.
                 print(message.role, message.text)
 """
 
-from brain.api import Brain, SessionRef, Since
+from brain.api import Brain, SessionRef, Since, project_root
 from brain.db import default_path
 from brain.errors import AmbiguousSession, BrainError, IndexFormatError, SessionNotFound
-from brain.models import AgentStats, Hit, IndexResult, Message, MessagePage, Session, Stats
+from brain.models import (AgentStats, Brief, Commit, Hit, IndexResult, Message, MessagePage,
+                          Session, Stats)
 from brain.query import parse_since, short_id
 from brain.sources import AGENTS
 
@@ -26,6 +27,8 @@ __all__ = [
     "AmbiguousSession",
     "Brain",
     "BrainError",
+    "Brief",
+    "Commit",
     "Hit",
     "IndexFormatError",
     "IndexResult",
@@ -38,5 +41,6 @@ __all__ = [
     "Stats",
     "default_path",
     "parse_since",
+    "project_root",
     "short_id",
 ]

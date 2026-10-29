@@ -99,7 +99,7 @@ def index_file(db: sqlite3.Connection, src: SourceFile, result: IndexResult) -> 
             for k, v in parsed.meta.items():
                 if v and (k not in meta or k in ("title", "custom_title")):
                     meta[k] = v
-            if m := parsed.message:
+            for m in parsed.messages:
                 rows.append((src.agent, src.session_id, message_key(m), m.ts, m.role, m.kind, m.text))
             if len(rows) >= BATCH:
                 added += write(db, src, rows, meta, pos, last, stat)

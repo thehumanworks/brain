@@ -21,6 +21,10 @@ TITLE = """coalesce(s.custom_title, s.title, (
     WHERE p.agent = s.agent AND p.session_id = s.session_id AND p.role = 'user' AND p.kind = 'text'
     ORDER BY p.ts, p.id LIMIT 1))"""
 
+# A `Session`'s fields, from `sessions s`.
+SESSION_COLUMNS = f"""agent, session_id, parent_id, cwd, {TITLE} AS title, started_at, updated_at,
+    messages, path"""
+
 
 @dataclass
 class Filters:
@@ -124,9 +128,7 @@ def sessions(db: sqlite3.Connection, filters: Filters, limit: int = 20,
         params["since"] = filters.since
     sql_where = ("WHERE " + " AND ".join(where)) if where else ""
     return [Session(**dict(r)) for r in db.execute(
-        f"""SELECT agent, session_id, parent_id, cwd, {TITLE} AS title,
-                   started_at, updated_at, messages, path
-            FROM sessions s {sql_where} ORDER BY updated_at DESC LIMIT :limit""",
+        f"SELECT {SESSION_COLUMNS} FROM sessions s {sql_where} ORDER BY updated_at DESC LIMIT :limit",
         {**params, "limit": limit},
     )]
 
@@ -135,9 +137,7 @@ def find_sessions(db: sqlite3.Connection, ref: str) -> list[Session]:
     """Sessions whose id equals, starts with or (hyphens aside) ends with `ref`."""
     flat = ref.replace("-", "").lower()
     return [Session(**dict(r)) for r in db.execute(
-        f"""SELECT agent, session_id, parent_id, cwd, {TITLE} AS title,
-                  started_at, updated_at, messages, path
-           FROM sessions s
+        f"""SELECT {SESSION_COLUMNS} FROM sessions s
            WHERE session_id = :ref OR session_id LIKE :prefix
               OR (length(:flat) >= 6 AND replace(lower(session_id), '-', '') LIKE :suffix)
            ORDER BY updated_at DESC LIMIT 10""",

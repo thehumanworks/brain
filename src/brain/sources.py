@@ -1,7 +1,7 @@
 """Where each agent keeps its transcripts, and how one transcript line becomes a message.
 
 Every agent writes one JSONL file per session and only ever appends to it, so a file is the
-unit we follow. Each parser turns one decoded line into at most one `Message` plus any session
+unit we follow. Each parser turns one decoded line into messages (usually one) plus any session
 metadata the line carries (working directory, title, parent session).
 """
 
@@ -45,7 +45,7 @@ class Message:
 
 @dataclass
 class Parsed:
-    message: Message | None = None
+    messages: list[Message] = field(default_factory=list)
     meta: dict = field(default_factory=dict)
 
 
@@ -106,7 +106,7 @@ def message(source_id, ts, role, kind, text) -> Parsed:
     text = text.strip()
     if not text:
         return Parsed()
-    return Parsed(Message(source_id, ts, role, kind, clip(text)))
+    return Parsed([Message(source_id, ts, role, kind, clip(text))])
 
 
 # --- Claude Code ------------------------------------------------------------------------------
@@ -223,6 +223,10 @@ def parse_codex(rec: dict, offset: int) -> Parsed:
 
 # --- Pi ---------------------------------------------------------------------------------------
 
+# The custom message brain's Pi extension starts a session with: a brief of earlier sessions,
+# which indexed would repeat their words in every session that follows.
+BRIEF_TYPE = "brain-brief"
+
 
 def parse_pi(rec: dict, offset: int) -> Parsed:
     kind = rec.get("type")
@@ -233,6 +237,8 @@ def parse_pi(rec: dict, offset: int) -> Parsed:
     if kind == "compaction":
         return message(source_id, ts, "system", "summary", rec.get("summary") or "")
     if kind == "custom_message":
+        if rec.get("customType") == BRIEF_TYPE:
+            return Parsed()
         return message(source_id, ts, "system", "context", content_text(rec.get("content")))
     if kind != "message":
         return Parsed()
@@ -249,8 +255,11 @@ def parse_pi(rec: dict, offset: int) -> Parsed:
     if role != "assistant":
         return Parsed()
 
-    what, parts = None, []
-    for block in content if isinstance(content, list) else [{"type": "text", "text": content}]:
+    # One line holds a whole reply; its thinking, text and tool calls become a message each, as
+    # Claude Code writes them, so a reply's text is told apart from the thinking before it.
+    parsed = Parsed()
+    blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+    for n, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
         btype = block.get("type")
@@ -262,10 +271,10 @@ def parse_pi(rec: dict, offset: int) -> Parsed:
             w, t = "tool_call", call_text(block.get("name"), block.get("arguments"))
         else:
             continue
-        if t:
-            what = what or w
-            parts.append(t)
-    return message(source_id, ts, "assistant", what or "text", "\n".join(parts))
+        if isinstance(t, str):
+            parsed.messages += message(f"{source_id}#{n}" if n else source_id, ts, "assistant", w,
+                                       t).messages
+    return parsed
 
 
 PARSERS = {"claude": parse_claude, "codex": parse_codex, "pi": parse_pi}
@@ -317,6 +326,10 @@ def discover() -> Iterator[SourceFile]:
             seen.add(m.group(1))
             yield SourceFile("codex", path, m.group(1))
 
-    root = pi_root()
-    for path in [*root.glob("sessions/*/*.jsonl"), *root.glob("bots/*/sessions/*.jsonl")]:
+    for path in pi_paths():
         yield SourceFile("pi", path, path.stem.rsplit("_", 1)[-1])
+
+
+def pi_paths() -> list[Path]:
+    root = pi_root()
+    return [*root.glob("sessions/*/*.jsonl"), *root.glob("bots/*/sessions/*.jsonl")]
