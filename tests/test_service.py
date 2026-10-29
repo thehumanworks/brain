@@ -2,7 +2,7 @@ import plistlib
 import shlex
 import unittest
 
-from brain import service
+from brain.cli import service
 
 COMMAND = ["/home/a b/.local/bin/brain", "--db", "/data/100%/$x/index.db", "watch"]
 ENV = {"CODEX_HOME": '/home/a b/co"dex', "BRAIN_DB": "/data/100%/index.db"}

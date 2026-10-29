@@ -1,7 +1,8 @@
 # brain
 
 Local full-text search over your Claude Code, Codex and Pi conversation history, for you and
-for your agents. Everything stays on your machine: one SQLite file, no server, no sync.
+for your agents. Everything stays on your machine: one SQLite file, no server, no sync. Use it
+through the `brain` command, or from Python as an SDK (see [Scripting](#scripting)).
 
 ```sh
 uv tool install --editable ~/brain   # puts `brain` on your PATH
@@ -258,6 +259,68 @@ instead of all of them, and `--raw` passes the query to
 column filters). Results are ranked with BM25, with tool output and injected context ranked
 below what you and the agent actually said.
 
+## Scripting
+
+The `brain` Python package is an SDK, and the `brain` command is built on it: a script can do
+anything the command does, with typed results instead of text, on the same index. The SDK
+needs only the standard library. `import brain` loads neither the command line nor its
+terminal library.
+
+```python
+from brain import Brain
+
+with Brain() as brain:  # $BRAIN_DB or ~/.local/share/brain/index.db, like the command
+    brain.index()  # optional: add what the agents wrote since the last run
+    for hit in brain.search("rate limiting", agent="codex", since="7d", limit=5):
+        print(hit.title, hit.snippet)
+        for m in brain.messages(hit, at=hit.id, context=2, tools=False):
+            print(f"  {m.role}: {m.text[:80]}")
+
+    for session in brain.sessions(project="api", limit=10):
+        print(session.session_id, session.title, session.messages)
+```
+
+Run a script with the SDK, without installing anything permanently:
+
+```sh
+uv run --with git+https://github.com/thehumanworks/brain script.py
+uv run --with-editable ~/brain script.py   # a local checkout, as it is now
+```
+
+Or declare it in the script ([inline script metadata](https://docs.astral.sh/uv/guides/scripts/))
+and run `uv run script.py`:
+
+```python
+# /// script
+# requires-python = ">=3.14"
+# dependencies = ["brain @ git+https://github.com/thehumanworks/brain"]
+# ///
+```
+
+`uv tool install` keeps the command in an environment of its own, which scripts don't see.
+
+| `Brain` method | Returns | Command |
+|---|---|---|
+| `index(progress=None)` | `IndexResult` | `brain index` |
+| `watch(interval=5)` | an endless iterator of `IndexResult`, one per run | `brain watch` |
+| `search(text, agent=, project=, since=, role=, limit=20, per_session=2, any_term=False, raw=False)` | `list[Hit]` | `brain search` |
+| `sessions(agent=, project=, since=, limit=20, subagents=False)` | `list[Session]` | `brain list` |
+| `session(ref)`, `find_sessions(ref)` | `Session`, `list[Session]` | `brain show <session>` |
+| `messages(session, at=None, context=10, tools=True)` | `list[Message]` | `brain show` |
+| `page(session, offset=0, limit=30, anchor=None, context=5, tools=True, keep=None)` | `MessagePage` | the `brain tui` reader |
+| `stats()` | `Stats` | `brain stats` |
+
+- Queries and filters work as on the command line. `since` also takes a `datetime` or unix
+  milliseconds, and a session is a `Session`, a `Hit` or an id as `brain show` takes it.
+- Results are frozen dataclasses; `dataclasses.asdict` gives the objects `--json` prints.
+  Times are unix milliseconds.
+- `Brain(path, readonly=True)` opens an existing index without writing to it. `brain.db` is
+  the `sqlite3` connection, for SQL of your own; like it, a `Brain` belongs to the thread that
+  opened it.
+- `brain.session(ref)` raises `SessionNotFound`, or `AmbiguousSession` with the candidates
+  in `.matches`; an index of another format raises `IndexFormatError`. All three are
+  `BrainError`s. SQLite and file errors pass through unchanged.
+
 ## Letting agents use it
 
 Add this to `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` and Pi's `~/.pi/agent/AGENTS.md`:
@@ -309,6 +372,10 @@ python -m unittest discover -s tests -v
 nix fmt
 nix flake check
 ```
+
+The SDK is `src/brain` (`api.py` holds `Brain`) and the command line is `src/brain/cli`
+(the commands, `tui.py` and `service.py`). The CLI imports only what `brain` exports, which a
+test enforces, along with the SDK never importing the CLI.
 
 The development shell uses Python 3.14 and imports `src/` from the checkout, and includes
 `uv` and the Nix formatter. No dependencies are installed into the host system.

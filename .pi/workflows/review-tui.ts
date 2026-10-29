@@ -10,7 +10,7 @@ export default defineWorkflow({
   async run(ctx) {
     return ctx.parallel(
       [
-        "Review src/brain/tui.py and tests/test_tui.py for real correctness, concurrency, pagination, keyboard navigation, and terminal-safety bugs. Read the query/db code as needed. Identify actionable bugs only, with file/line references. Do not edit files.",
+        "Review src/brain/cli/tui.py and tests/test_tui.py for real correctness, concurrency, pagination, keyboard navigation, and terminal-safety bugs. Read the query/db code as needed. Identify actionable bugs only, with file/line references. Do not edit files.",
         "Review the uncommitted Brain TUI changes for CLI/headless compatibility, Python/uv/Nix packaging, useful test coverage and documentation accuracy. Inspect diffs and relevant files. Do not edit files. Report concrete bugs or important omissions with file/line references.",
       ].map(
         (prompt, i) => () =>

@@ -11,23 +11,16 @@ under a new id (Claude Code does, on compaction) stores it twice.
 import hashlib
 import json
 import sqlite3
+import time
 from compression import zstd
-from dataclasses import dataclass, field
 from pathlib import Path
 
+from brain.models import IndexResult
 from brain.sources import PARSERS, WANTED, SourceFile, codex_root, discover
 
 # Messages written per transaction: bounds memory on a first read of a large transcript and how
 # long a search waits for the write lock.
 BATCH = 2000
-
-
-@dataclass
-class Result:
-    files: int = 0  # transcripts with something new
-    messages: int = 0  # messages added
-    rereads: int = 0  # transcripts rewritten underneath us and read again
-    errors: list[str] = field(default_factory=list)
 
 
 def digest(line: bytes) -> str:
@@ -44,9 +37,10 @@ def open_bytes(path: Path):
     return zstd.open(path, "rb") if path.suffix == ".zst" else open(path, "rb")
 
 
-def index_all(db: sqlite3.Connection, progress=None) -> Result:
+def index_all(db: sqlite3.Connection, progress=None) -> IndexResult:
     """Index every transcript; `progress(done, total, result)` is called every 100 files."""
-    result = Result()
+    started = time.monotonic()
+    result = IndexResult()
     sources = list(discover())
     for n, src in enumerate(sources):
         if progress and n % 100 == 0:
@@ -59,10 +53,11 @@ def index_all(db: sqlite3.Connection, progress=None) -> Result:
         index_codex_titles(db, force=result.files > 0)
     except OSError as e:
         result.errors.append(f"codex titles: {e}")
+    result.seconds = time.monotonic() - started
     return result
 
 
-def index_file(db: sqlite3.Connection, src: SourceFile, result: Result) -> None:
+def index_file(db: sqlite3.Connection, src: SourceFile, result: IndexResult) -> None:
     try:
         st = src.path.stat()
     except FileNotFoundError:

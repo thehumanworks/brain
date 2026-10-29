@@ -269,6 +269,7 @@ def parse_pi(rec: dict, offset: int) -> Parsed:
 
 
 PARSERS = {"claude": parse_claude, "codex": parse_codex, "pi": parse_pi}
+AGENTS = tuple(PARSERS)
 
 # Cheap byte tests that let us skip decoding lines no parser wants. A false positive costs a
 # json.loads; a false negative would lose data, so these only ever match too much.

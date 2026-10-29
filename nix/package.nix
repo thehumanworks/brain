@@ -31,8 +31,9 @@ python314Packages.buildPythonApplication {
   '';
 
   pythonImportsCheck = [
+    "brain"
     "brain.cli"
-    "brain.tui"
+    "brain.cli.tui"
     "compression.zstd"
     "sqlite3"
   ];

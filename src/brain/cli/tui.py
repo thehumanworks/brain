@@ -5,8 +5,6 @@ import sqlite3
 import threading
 import unicodedata
 from bisect import bisect_right
-from contextlib import closing
-from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -22,11 +20,12 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.utils import get_cwidth
 
-from brain import db as dbmod, query
+import brain
+from brain import Brain, BrainError, Hit, MessagePage, Session
 
 RESULT_BATCH = 100
 MESSAGE_PAGE = 30
-AGENTS = (None, "claude", "codex", "pi")
+AGENTS = (None, *brain.AGENTS)
 
 
 def safe_text(value: str | None) -> str:
@@ -64,94 +63,61 @@ def visual_starts(line: str, width: int) -> tuple[int, ...]:
     return tuple(starts)
 
 
-def identity(row: dict) -> tuple:
-    return row["agent"], row["session_id"], row.get("id")
+def hit_id(row) -> int | None:
+    """The matched message of a search hit; None for a session from the recent list."""
+    return getattr(row, "id", None)
 
 
-@dataclass
-class MessagePage:
-    rows: list[dict]
-    offset: int
-    total: int
+def identity(row: Hit | Session) -> tuple:
+    return row.agent, row.session_id, hit_id(row)
 
 
 class IndexReader:
-    """One short-lived read-only connection per worker request, safe alongside the watcher."""
+    """One short-lived read-only Brain per worker request, safe alongside the watcher."""
 
     def __init__(self, path: Path):
         self.path = path
 
-    def connect(self, cancelled: threading.Event | None = None) -> sqlite3.Connection:
+    def open(self, cancelled: threading.Event | None = None) -> Brain:
         if cancelled and cancelled.is_set():
             raise sqlite3.OperationalError("interrupted")
-        db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
-        try:
-            db.row_factory = sqlite3.Row
-            if cancelled is not None:
-                db.set_progress_handler(lambda: int(cancelled.is_set()), 1000)
-            if db.execute("PRAGMA user_version").fetchone()[0] != dbmod.VERSION:
-                raise sqlite3.DatabaseError("unsupported index format; use a compatible version of brain")
-            return db
-        except BaseException:
-            db.close()
-            raise
+        return Brain(self.path, readonly=True, timeout=2,
+                     interrupt=cancelled.is_set if cancelled is not None else None)
 
-    def results(self, text: str, filters: query.Filters, limit: int,
-                subagents: bool, *, cancelled: threading.Event | None = None) -> tuple[list[dict], bool]:
-        with closing(self.connect(cancelled)) as db:
-            db.execute("BEGIN")
+    def results(self, text: str, limit: int, subagents: bool, *, agent: str | None = None,
+                project: str | None = None, since: int | None = None,
+                cancelled: threading.Event | None = None) -> tuple[list[Hit | Session], bool]:
+        with self.open(cancelled) as index:
             if text.strip():
-                rows = query.search(db, text, filters, limit=limit + 1)
+                rows = index.search(text, agent=agent, project=project, since=since,
+                                    limit=limit + 1)
             else:
-                rows = query.sessions(db, filters, limit=limit + 1, subagents=subagents)
+                rows = index.sessions(agent=agent, project=project, since=since,
+                                      limit=limit + 1, subagents=subagents)
             return rows[:limit], len(rows) > limit
 
-    def messages(self, row: dict, offset: int = 0, anchor: int | None = None,
+    def messages(self, row, offset: int = 0, anchor: int | None = None,
                  tools: bool = True, *, context: int = 5,
                  cancelled: threading.Event | None = None) -> MessagePage:
-        with closing(self.connect(cancelled)) as db:
+        with self.open(cancelled) as index:
             # Keep the matched message visible even when it is a hidden tool result.
-            where = "agent = :agent AND session_id = :session"
-            params = {"agent": row["agent"], "session": row["session_id"], "hit": row.get("id")}
-            if not tools:
-                where += " AND (kind NOT IN ('tool_call', 'tool_result') OR id = :hit)"
-            # A transaction gives counts, anchors and rows one consistent snapshot.
-            db.execute("BEGIN")
-            total = db.execute(f"SELECT count(*) FROM messages WHERE {where}", params).fetchone()[0]
-            if anchor is not None:
-                target = db.execute(
-                    "SELECT ts FROM messages WHERE agent = :agent AND session_id = :session AND id = :anchor",
-                    {**params, "anchor": anchor},
-                ).fetchone()
-                if target:
-                    # Find the insertion position even when toggling tools hides the anchor.
-                    # SQLite sorts NULL timestamps first; equal timestamps use message IDs.
-                    position = db.execute(
-                        f"SELECT count(*) FROM messages WHERE {where} AND (ts < :ts "
-                        "OR (ts IS NULL AND :ts IS NOT NULL) OR (ts IS :ts AND id < :anchor))",
-                        {**params, "anchor": anchor, "ts": target["ts"]},
-                    ).fetchone()[0]
-                    offset = max(0, position - context)
-            offset = max(0, min(offset, max(0, total - 1)))
-            rows = db.execute(
-                f"SELECT id, ts, role, kind, text FROM messages WHERE {where} "
-                "ORDER BY ts, id LIMIT :limit OFFSET :offset",
-                {**params, "limit": MESSAGE_PAGE, "offset": offset},
-            )
-            return MessagePage([dict(r) for r in rows], offset, total)
+            return index.page(row, offset=offset, limit=MESSAGE_PAGE, anchor=anchor,
+                              context=context, tools=tools, keep=hit_id(row))
 
 
 class Browser:
-    def __init__(self, path: Path, *, text: str = "", filters: query.Filters | None = None,
+    def __init__(self, path: Path, *, text: str = "", agent: str | None = None,
+                 project: str | None = None, since: int | None = None,
                  subagents: bool = False, input=None, output=None):
         self.reader = IndexReader(path)
-        self.filters = filters or query.Filters()
+        self.agent = agent
+        self.since = since
         self.subagents = subagents
-        self.rows: list[dict] = []
+        self.rows: list[Hit | Session] = []
         self.selected = 0
         self.limit = RESULT_BATCH
         self.has_more = False
-        self.active: dict | None = None
+        self.active: Hit | Session | None = None
         self.page = MessagePage([], 0, 0)
         self.message_positions: list[tuple[int, int]] = []
         self.show_tools = True
@@ -161,7 +127,7 @@ class Browser:
         self.task: asyncio.Task | None = None
         self.cancelled = threading.Event()
         self.applied_text = text
-        self.applied_project = self.filters.project or ""
+        self.applied_project = project or ""
 
         self.search = TextArea(text=text, multiline=False, prompt="Search  › ",
                                accept_handler=lambda _: self.submit())
@@ -194,10 +160,10 @@ class Browser:
         self.app.ttimeoutlen = 0.1
 
     def heading(self) -> str:
-        agent = self.filters.agent or "all agents"
+        agent = self.agent or "all agents"
         if self.active:
-            title = one_line(self.active.get("title")) or "Untitled conversation"
-            return f" brain · {self.active['agent']} · {title}"
+            title = one_line(self.active.title) or "Untitled conversation"
+            return f" brain · {self.active.agent} · {title}"
         return f" brain · {agent} · {'Search results' if self.applied_text.strip() else 'Recent conversations'}"
 
     def result_text(self) -> list[tuple[str, str]]:
@@ -207,12 +173,14 @@ class Browser:
         lines = []
         for i, row in enumerate(self.rows):
             style = "class:selected" if i == self.selected else ""
-            title = one_line(row.get("title")) or "Untitled conversation"
-            date = timestamp(row.get("ts", row.get("updated_at")))
-            detail = one_line(row.get("snippet")) if "snippet" in row else f"{row['messages']} messages"
+            title = one_line(row.title) or "Untitled conversation"
+            if isinstance(row, Hit):
+                date, detail = timestamp(row.ts), one_line(row.snippet)
+            else:
+                date, detail = timestamp(row.updated_at), f"{row.messages} messages"
             lines.extend([
                 (style, f"{'›' if i == self.selected else ' '} {title}\n"),
-                (style or "class:meta", f"  {row['agent']} · {date} · {one_line(row.get('cwd'))}\n"),
+                (style or "class:meta", f"  {row.agent} · {date} · {one_line(row.cwd)}\n"),
                 (style, f"  {detail}\n"),
             ])
         return lines
@@ -223,10 +191,10 @@ class Browser:
         if self.loading:
             return " Loading… (Ctrl-Q to quit)"
         if self.active:
-            start = self.page.offset + 1 if self.page.rows else 0
-            end = self.page.offset + len(self.page.rows)
+            start = self.page.offset + 1 if self.page.messages else 0
+            end = self.page.offset + len(self.page.messages)
             return f" Messages {start}–{end} of {self.page.total} · tools {'shown' if self.show_tools else 'hidden'}"
-        return f" {len(self.rows)} results{' · more available (m)' if self.has_more else ''} · F2 agent: {self.filters.agent or 'all'}"
+        return f" {len(self.rows)} results{' · more available (m)' if self.has_more else ''} · F2 agent: {self.agent or 'all'}"
 
     def help_text(self) -> str:
         if self.active:
@@ -248,7 +216,7 @@ class Browser:
         async def load():
             try:
                 result = await asyncio.to_thread(work, cancelled)
-            except (sqlite3.Error, OSError) as exc:
+            except (sqlite3.Error, OSError, BrainError) as exc:
                 if generation == self.generation:
                     self.error = f"Cannot read index: {exc}. Run brain index if needed; F5 retries."
             else:
@@ -266,14 +234,14 @@ class Browser:
         old = identity(self.rows[self.selected]) if preserve and self.rows else None
         # Snapshot values before starting a worker; edits cannot change an in-flight query.
         text, limit, subagents = self.applied_text, self.limit, self.subagents
-        filters = query.Filters(self.filters.agent, self.applied_project or None, self.filters.since)
+        filters = {"agent": self.agent, "project": self.applied_project or None, "since": self.since}
 
         def apply(result):
             self.rows, self.has_more = result
             self.selected = next((i for i, row in enumerate(self.rows) if identity(row) == old), 0)
             self.result_window.vertical_scroll = 0
 
-        self.request(lambda cancel: self.reader.results(text, filters, limit, subagents,
+        self.request(lambda cancel: self.reader.results(text, limit, subagents, **filters,
                                                        cancelled=cancel), apply)
 
     def submit(self) -> bool:
@@ -292,23 +260,23 @@ class Browser:
         self.page = MessagePage([], 0, 0)
         self.body.buffer.set_document(Document("Loading…"), bypass_readonly=True)
         self.app.layout.focus(self.body)
-        self.load_messages(anchor=self.active.get("id"))
+        self.load_messages(anchor=hit_id(self.active))
 
     def load_messages(self, offset: int = 0, anchor: int | None = None, context: int = 5) -> None:
-        row, tools = dict(self.active), self.show_tools
+        row, tools = self.active, self.show_tools
 
         def apply(page):
             self.page = page
             chunks, cursor, length = [], 0, 0
             self.message_positions = []
-            for message in page.rows:
-                self.message_positions.append((length, message["id"]))
-                matched = message["id"] == row.get("id")
-                if message["id"] == anchor:
+            for message in page.messages:
+                self.message_positions.append((length, message.id))
+                matched = message.id == hit_id(row)
+                if message.id == anchor:
                     cursor = length
-                header = (f"{'▶ MATCH · ' if matched else ''}{message['role']} / {message['kind']}"
-                          f" · {timestamp(message['ts'])}\n")
-                chunk = safe_text(header + message["text"]).expandtabs(4) + "\n\n"
+                header = (f"{'▶ MATCH · ' if matched else ''}{message.role} / {message.kind}"
+                          f" · {timestamp(message.ts)}\n")
+                chunk = safe_text(header + message.text).expandtabs(4) + "\n\n"
                 chunks.append(chunk)
                 length += len(chunk)
             content = "".join(chunks) or "No messages in this conversation."
@@ -412,7 +380,7 @@ class Browser:
 
         @kb.add("f2")
         def agent(event):
-            self.filters.agent = AGENTS[(AGENTS.index(self.filters.agent) + 1) % len(AGENTS)]
+            self.agent = AGENTS[(AGENTS.index(self.agent) + 1) % len(AGENTS)]
             self.submit()
 
         @kb.add("f3", filter=reading)
@@ -435,8 +403,8 @@ class Browser:
 
         @kb.add("f7", filter=reading)
         def following(event):
-            if not self.loading and self.page.offset + len(self.page.rows) < self.page.total:
-                self.load_messages(self.page.offset + len(self.page.rows))
+            if not self.loading and self.page.offset + len(self.page.messages) < self.page.total:
+                self.load_messages(self.page.offset + len(self.page.messages))
 
         return kb
 

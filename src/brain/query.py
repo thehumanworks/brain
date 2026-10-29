@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
+from brain.models import Hit, Message, MessagePage, Session
+
 # Tool calls (whole files written), tool output and injected context match a lot of words
 # without being what was said, so their BM25 scores (negative, lower is better) are scaled
 # towards zero.
@@ -68,7 +70,7 @@ def fts_query(text: str, any_term: bool = False) -> str:
 
 
 def search(db: sqlite3.Connection, query: str, filters: Filters, limit: int = 20,
-           per_session: int = 2, raw: bool = False, any_term: bool = False) -> list[dict]:
+           per_session: int = 2, raw: bool = False, any_term: bool = False) -> list[Hit]:
     match = query if raw else fts_query(query, any_term)
     if not match:
         return []
@@ -103,12 +105,12 @@ def search(db: sqlite3.Connection, query: str, filters: Filters, limit: int = 20
             "WHERE messages_fts MATCH ? AND rowid = ?",
             (match, row["id"]),
         ).fetchone()[0]
-        results.append({**dict(row), "snippet": snip})
+        results.append(Hit(**dict(row), snippet=snip))
     return results
 
 
 def sessions(db: sqlite3.Connection, filters: Filters, limit: int = 20,
-             subagents: bool = False) -> list[dict]:
+             subagents: bool = False) -> list[Session]:
     """The `limit` most recently updated sessions, without subagents unless asked for."""
     where, params = [] if subagents else ["parent_id IS NULL"], {}
     if filters.agent:
@@ -121,7 +123,7 @@ def sessions(db: sqlite3.Connection, filters: Filters, limit: int = 20,
         where.append("updated_at >= :since")
         params["since"] = filters.since
     sql_where = ("WHERE " + " AND ".join(where)) if where else ""
-    return [dict(r) for r in db.execute(
+    return [Session(**dict(r)) for r in db.execute(
         f"""SELECT agent, session_id, parent_id, cwd, {TITLE} AS title,
                    started_at, updated_at, messages, path
             FROM sessions s {sql_where} ORDER BY updated_at DESC LIMIT :limit""",
@@ -129,10 +131,10 @@ def sessions(db: sqlite3.Connection, filters: Filters, limit: int = 20,
     )]
 
 
-def find_session(db: sqlite3.Connection, ref: str) -> list[dict]:
+def find_sessions(db: sqlite3.Connection, ref: str) -> list[Session]:
     """Sessions whose id equals, starts with or (hyphens aside) ends with `ref`."""
     flat = ref.replace("-", "").lower()
-    return [dict(r) for r in db.execute(
+    return [Session(**dict(r)) for r in db.execute(
         f"""SELECT agent, session_id, parent_id, cwd, {TITLE} AS title,
                   started_at, updated_at, messages, path
            FROM sessions s
@@ -144,17 +146,51 @@ def find_session(db: sqlite3.Connection, ref: str) -> list[dict]:
 
 
 def messages(db: sqlite3.Connection, agent: str, session_id: str, at: int | None = None,
-             context: int = 10, tools: bool = True) -> list[dict]:
+             context: int = 10, tools: bool = True) -> list[Message]:
     """A session's messages in order; with `at`, only the `context` either side of that one."""
-    rows = [dict(r) for r in db.execute(
+    rows = [Message(**dict(r)) for r in db.execute(
         "SELECT id, ts, role, kind, text FROM messages WHERE agent = ? AND session_id = ? "
         "ORDER BY ts, id", (agent, session_id))]
     if not tools:
-        rows = [r for r in rows if r["kind"] not in ("tool_call", "tool_result") or r["id"] == at]
-    idx = next((i for i, r in enumerate(rows) if r["id"] == at), None)
+        rows = [r for r in rows if r.kind not in ("tool_call", "tool_result") or r.id == at]
+    idx = next((i for i, r in enumerate(rows) if r.id == at), None)
     if idx is None:
         return rows
     return rows[max(0, idx - context): idx + context + 1]
+
+
+def page(db: sqlite3.Connection, agent: str, session_id: str, offset: int = 0, limit: int = 30,
+         anchor: int | None = None, context: int = 5, tools: bool = True,
+         keep: int | None = None) -> MessagePage:
+    """`limit` messages from `offset`, or from `context` before `anchor`; without `tools`, tool
+    calls and results other than `keep` are left out. Run it in one transaction, so the total,
+    the anchor's position and the rows agree."""
+    where = "agent = :agent AND session_id = :session"
+    params = {"agent": agent, "session": session_id, "keep": keep}
+    if not tools:
+        where += " AND (kind NOT IN ('tool_call', 'tool_result') OR id = :keep)"
+    total = db.execute(f"SELECT count(*) FROM messages WHERE {where}", params).fetchone()[0]
+    if anchor is not None:
+        target = db.execute(
+            "SELECT ts FROM messages WHERE agent = :agent AND session_id = :session AND id = :anchor",
+            {**params, "anchor": anchor},
+        ).fetchone()
+        if target:
+            # Find the insertion position even when hiding tools hides the anchor.
+            # SQLite sorts NULL timestamps first; equal timestamps use message IDs.
+            position = db.execute(
+                f"SELECT count(*) FROM messages WHERE {where} AND (ts < :ts "
+                "OR (ts IS NULL AND :ts IS NOT NULL) OR (ts IS :ts AND id < :anchor))",
+                {**params, "anchor": anchor, "ts": target["ts"]},
+            ).fetchone()[0]
+            offset = max(0, position - context)
+    offset = max(0, min(offset, max(0, total - 1)))
+    rows = db.execute(
+        f"SELECT id, ts, role, kind, text FROM messages WHERE {where} "
+        "ORDER BY ts, id LIMIT :limit OFFSET :offset",
+        {**params, "limit": limit, "offset": offset},
+    )
+    return MessagePage([Message(**dict(r)) for r in rows], offset, total)
 
 
 def short_id(session_id: str) -> str:

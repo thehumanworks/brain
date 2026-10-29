@@ -10,13 +10,19 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from brain import cli, db as dbmod, query
-from brain.tui import Browser, IndexReader, MESSAGE_PAGE, safe_text, visual_starts
+from brain import Brain, BrainError, Session, cli
+from brain.cli.tui import Browser, IndexReader, MESSAGE_PAGE, safe_text, visual_starts
+
+
+def as_hit(row: Session, message_id: int) -> SimpleNamespace:
+    """What the reader needs of a search hit: its session and matched message."""
+    return SimpleNamespace(agent=row.agent, session_id=row.session_id, id=message_id)
 
 
 class IndexFixture:
@@ -25,8 +31,9 @@ class IndexFixture:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "index.db"
-        self.db = dbmod.connect(self.path)
-        self.addCleanup(self.db.close)
+        self.brain = Brain(self.path)
+        self.addCleanup(self.brain.close)
+        self.db = self.brain.db
         self.reader = IndexReader(self.path)
 
     def session(self, agent="claude", sid="session", title="Conversation", texts=("hello",),
@@ -46,7 +53,7 @@ class IndexFixture:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (agent, sid, str(i), 1000 + i, "tool" if kind == "tool_result" else "user", kind, text),
             ).lastrowid)
-        return {"agent": agent, "session_id": sid, "title": title}, ids
+        return Session(agent, sid, parent, cwd, title, 1000, updated, len(texts), "/transcript.jsonl"), ids
 
 
 class ReaderTest(IndexFixture, unittest.TestCase):
@@ -54,15 +61,15 @@ class ReaderTest(IndexFixture, unittest.TestCase):
         self.session(sid="old", title="Old", texts=("rate limiting",), updated=1000)
         self.session(sid="new", title="New", texts=("rate limiting",), updated=3000, cwd="/work/web")
         self.session(agent="pi", sid="child", texts=("rate limiting",), updated=4000, parent="new")
-        rows, more = self.reader.results("", query.Filters(), 1, False)
-        self.assertEqual([r["title"] for r in rows], ["New"])
+        rows, more = self.reader.results("", 1, False)
+        self.assertEqual([r.title for r in rows], ["New"])
         self.assertTrue(more)
-        rows, more = self.reader.results("rate", query.Filters(agent="claude", project="api"), 100, False)
-        self.assertEqual([r["session_id"] for r in rows], ["old"])
+        rows, more = self.reader.results("rate", 100, False, agent="claude", project="api")
+        self.assertEqual([r.session_id for r in rows], ["old"])
         self.assertFalse(more)
-        rows, _ = self.reader.results("", query.Filters(since=3500), 100, True)
-        self.assertEqual([r["session_id"] for r in rows], ["child"])
-        self.assertEqual(self.reader.results("-- ' \"", query.Filters(), 100, False), ([], False))
+        rows, _ = self.reader.results("", 100, True, since=3500)
+        self.assertEqual([r.session_id for r in rows], ["child"])
+        self.assertEqual(self.reader.results("-- ' \"", 100, False), ([], False))
 
     def test_pages_cover_session_exactly_and_anchor_uses_agent_and_message(self):
         self.session(agent="pi", sid="same", texts=("wrong agent",))
@@ -73,23 +80,23 @@ class ReaderTest(IndexFixture, unittest.TestCase):
         found, offset = [], 0
         while True:
             page = self.reader.messages(row, offset)
-            found.extend(r["id"] for r in page.rows)
-            self.assertLessEqual(len(page.rows), MESSAGE_PAGE)
+            found.extend(r.id for r in page.messages)
+            self.assertLessEqual(len(page.messages), MESSAGE_PAGE)
             self.assertEqual(page.total, 75)
-            offset += len(page.rows)
+            offset += len(page.messages)
             if offset >= page.total:
                 break
         self.assertEqual(found, ids)
-        hit = self.reader.messages({**row, "id": ids[55]}, anchor=ids[55])
+        hit = self.reader.messages(as_hit(row, ids[55]), anchor=ids[55])
         self.assertEqual(hit.offset, 50)
-        self.assertEqual(hit.rows[5]["id"], ids[55])
-        self.assertNotIn("wrong agent", [r["text"] for r in hit.rows])
+        self.assertEqual(hit.messages[5].id, ids[55])
+        self.assertNotIn("wrong agent", [r.text for r in hit.messages])
 
     def test_hiding_tools_retains_the_matched_tool_message(self):
         row, ids = self.session(texts=("question", ("tool_result", "hidden"),
                                       ("tool_result", "matched"), "answer"))
-        page = self.reader.messages({**row, "id": ids[2]}, anchor=ids[2], tools=False)
-        self.assertEqual([r["text"] for r in page.rows], ["question", "matched", "answer"])
+        page = self.reader.messages(as_hit(row, ids[2]), anchor=ids[2], tools=False)
+        self.assertEqual([r.text for r in page.messages], ["question", "matched", "answer"])
         self.assertEqual(page.total, 3)
 
     def test_hidden_anchor_keeps_place_instead_of_jumping_to_session_start(self):
@@ -97,30 +104,30 @@ class ReaderTest(IndexFixture, unittest.TestCase):
             ("tool_result", "hidden anchor") if i == 50 else f"message {i}" for i in range(80)))
         page = self.reader.messages(row, anchor=ids[50], tools=False)
         self.assertEqual(page.offset, 45)
-        self.assertNotIn(ids[50], [r["id"] for r in page.rows])
-        self.assertIn(ids[51], [r["id"] for r in page.rows])
+        self.assertNotIn(ids[50], [r.id for r in page.messages])
+        self.assertIn(ids[51], [r.id for r in page.messages])
 
     def test_reader_does_not_create_or_mutate_an_index(self):
         missing = self.path.parent / "absent" / "index.db"
         with self.assertRaises(sqlite3.OperationalError):
-            IndexReader(missing).results("", query.Filters(), 100, False)
+            IndexReader(missing).results("", 100, False)
         self.assertFalse(missing.parent.exists())
-        connection = self.reader.connect()
-        self.addCleanup(connection.close)
+        reader = self.reader.open()
+        self.addCleanup(reader.close)
         with self.assertRaises(sqlite3.OperationalError):
-            connection.execute("DELETE FROM messages")
+            reader.db.execute("DELETE FROM messages")
         self.db.execute("PRAGMA user_version = 999")
-        with self.assertRaisesRegex(sqlite3.DatabaseError, "unsupported index format"):
-            self.reader.results("", query.Filters(), 100, False)
+        with self.assertRaisesRegex(BrainError, "index format 999"):
+            self.reader.results("", 100, False)
         self.assertEqual(self.db.execute("PRAGMA user_version").fetchone()[0], 999)
 
     def test_cancel_interrupts_sql_instead_of_only_hiding_old_results(self):
         cancelled = threading.Event()
-        db = self.reader.connect(cancelled)
-        self.addCleanup(db.close)
+        reader = self.reader.open(cancelled)
+        self.addCleanup(reader.close)
         cancelled.set()
         with self.assertRaisesRegex(sqlite3.OperationalError, "interrupted"):
-            db.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL "
+            reader.db.execute("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL "
                        "SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n").fetchone()
 
     def test_visual_lines_use_terminal_cells_not_codepoint_count(self):
@@ -174,10 +181,10 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
         await self.wait(lambda: not browser.loading and browser.applied_text == "unique needle")
         self.assertEqual(len(browser.rows), 1)
         self.assertIn("Fix deploy", "".join(t for _, t in browser.result_text()))
-        self.assertEqual(browser.rows[0]["id"], ids[45])
+        self.assertEqual(browser.rows[0].id, ids[45])
         await self.keys("\r")
         await self.wait(lambda: browser.active is not None and not browser.loading)
-        self.assertEqual(browser.active["agent"], "claude")
+        self.assertEqual(browser.active.agent, "claude")
         self.assertTrue(browser.body.document.current_line.startswith("▶ MATCH"))
         self.assertIn("unique needle", browser.body.text)
         cursor = browser.body.buffer.cursor_position
@@ -186,7 +193,7 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
         await self.keys("\x1b")
         await self.wait(lambda: browser.active is None)
         self.assertEqual(browser.search.text, "unique needle")
-        self.assertEqual(browser.rows[browser.selected]["id"], ids[45])
+        self.assertEqual(browser.rows[browser.selected].id, ids[45])
         self.assertTrue(browser.app.layout.has_focus(browser.result_control))
 
     async def test_select_refresh_project_filter_and_agent_cycle(self):
@@ -195,16 +202,16 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
         browser = await self.start()
         await self.keys("\t\t\x1b[B")  # Search -> project -> results, then select second row.
         await self.wait(lambda: browser.selected == 1)
-        self.assertEqual(browser.rows[browser.selected]["title"], "Old")
+        self.assertEqual(browser.rows[browser.selected].title, "Old")
         self.session(sid="latest", title="Latest", updated=3000)
         await self.keys("\x1b[15~")  # F5 refresh, preserve the selected identity despite reorder.
         await self.wait(lambda: len(browser.rows) == 3 and not browser.loading)
-        self.assertEqual(browser.rows[browser.selected]["title"], "Old")
+        self.assertEqual(browser.rows[browser.selected].title, "Old")
         await self.keys("/\tweb\r")  # Project filter is editable in the UI.
         await self.wait(lambda: browser.applied_project == "web" and not browser.loading)
-        self.assertEqual([r["title"] for r in browser.rows], ["New"])
+        self.assertEqual([r.title for r in browser.rows], ["New"])
         await self.keys("\x1bOQ")  # F2: all -> Claude; no results with project=web.
-        await self.wait(lambda: browser.filters.agent == "claude" and not browser.loading)
+        await self.wait(lambda: browser.agent == "claude" and not browser.loading)
         self.assertEqual(browser.rows, [])
 
     async def test_conversation_paging_and_tools_toggle(self):
@@ -216,7 +223,7 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(browser.page.offset, 0)
         await self.keys("\x1b[18~")  # F7 next page.
         await self.wait(lambda: browser.page.offset == MESSAGE_PAGE and not browser.loading)
-        self.assertEqual(browser.page.rows[0]["id"], ids[MESSAGE_PAGE])
+        self.assertEqual(browser.page.messages[0].id, ids[MESSAGE_PAGE])
         await self.keys("\x1b[17~")  # F6 previous page.
         await self.wait(lambda: browser.page.offset == 0 and not browser.loading)
         await self.keys("\x1bOR")  # F3 hides tools.
@@ -232,14 +239,14 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
         await self.wait(lambda: browser.active is not None and not browser.loading)
         await self.keys("\x1b[18~")
         await self.wait(lambda: browser.page.offset == 30 and not browser.loading)
-        self.assertEqual(browser.page.rows[0]["id"], ids[30])
+        self.assertEqual(browser.page.messages[0].id, ids[30])
         await self.keys("\x1bOR")
         await self.wait(lambda: not browser.show_tools and not browser.loading)
-        self.assertEqual(browser.page.rows[0]["id"], ids[31])
+        self.assertEqual(browser.page.messages[0].id, ids[31])
         for tools in (True, False, True):
             await self.keys("\x1bOR")
             await self.wait(lambda: browser.show_tools == tools and not browser.loading)
-            self.assertEqual(browser.page.rows[0]["id"], ids[31])
+            self.assertEqual(browser.page.messages[0].id, ids[31])
 
     async def test_wrapped_paragraph_can_be_read_without_skipping_any_screenful(self):
         paragraph = " ".join(f"word{i:05}" for i in range(2000))
@@ -336,11 +343,11 @@ class BrowserTest(IndexFixture, unittest.IsolatedAsyncioTestCase):
                 await self.wait(started.is_set)
                 await self.keys("/\x01\x0bfast\r")  # Replace the query while the worker is blocked.
                 await self.wait(lambda: browser.applied_text == "fast" and not browser.loading)
-                self.assertEqual([r["session_id"] for r in browser.rows], ["fast"])
+                self.assertEqual([r.session_id for r in browser.rows], ["fast"])
             finally:
                 release.set()
             await self.wait(finished.is_set)
-            self.assertEqual([r["session_id"] for r in browser.rows], ["fast"])
+            self.assertEqual([r.session_id for r in browser.rows], ["fast"])
 
 
 class CliTest(IndexFixture, unittest.TestCase):
@@ -365,15 +372,15 @@ class CliTest(IndexFixture, unittest.TestCase):
 
     def test_terminal_default_and_explicit_tui_forward_options(self):
         with mock.patch("sys.stdin.isatty", return_value=True), \
-             mock.patch("sys.stdout.isatty", return_value=True), mock.patch("brain.tui.run") as run:
+             mock.patch("sys.stdout.isatty", return_value=True), mock.patch("brain.cli.tui.run") as run:
             cli.main(["--db", str(self.path)])
             self.assertEqual(run.call_args.args, (self.path,))
             cli.main(["--db", str(self.path), "tui", "rate", "limit", "--agent", "pi",
                       "--project", "api", "--since", "2026-01-01", "--all"])
             self.assertEqual(run.call_args.kwargs["text"], "rate limit")
-            filters = run.call_args.kwargs["filters"]
-            self.assertEqual((filters.agent, filters.project), ("pi", "api"))
-            self.assertIsInstance(filters.since, int)
+            kwargs = run.call_args.kwargs
+            self.assertEqual((kwargs["agent"], kwargs["project"]), ("pi", "api"))
+            self.assertIsInstance(kwargs["since"], int)
             self.assertTrue(run.call_args.kwargs["subagents"])
             run.reset_mock()
             with self.assertRaisesRegex(SystemExit, "invalid --since"):

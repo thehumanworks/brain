@@ -4,6 +4,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+from brain.errors import IndexFormatError
+
 VERSION = 1
 
 SCHEMA = """
@@ -65,17 +67,29 @@ def default_path() -> Path:
     return data / "brain" / "index.db"
 
 
-def connect(path: Path | None = None) -> sqlite3.Connection:
+def connect(path: Path | None = None, *, readonly: bool = False,
+            timeout: float = 30) -> sqlite3.Connection:
+    """Open the index, creating it on first use. A read-only connection never writes, not even to
+    create the index, so it fails unless the index exists."""
     path = path or default_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path, timeout=30, isolation_level=None)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode = WAL")
-    db.execute("PRAGMA synchronous = NORMAL")
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version == 0:
-        db.executescript(f"BEGIN; {SCHEMA} PRAGMA user_version = {VERSION}; COMMIT;")
-    elif version != VERSION:
-        raise SystemExit(f"{path} has index format {version}, this brain expects {VERSION}: "
-                         "delete it and run `brain index` to rebuild")
-    return db
+    if readonly:
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=timeout,
+                             isolation_level=None)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(path, timeout=timeout, isolation_level=None)
+    try:
+        db.row_factory = sqlite3.Row
+        if not readonly:
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute("PRAGMA synchronous = NORMAL")
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0 and not readonly:
+            db.executescript(f"BEGIN; {SCHEMA} PRAGMA user_version = {VERSION}; COMMIT;")
+        elif version != VERSION:
+            raise IndexFormatError(f"{path} has index format {version}, this brain expects "
+                                   f"{VERSION}: delete it and run `brain index` to rebuild")
+        return db
+    except BaseException:
+        db.close()
+        raise
