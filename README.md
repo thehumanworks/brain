@@ -18,6 +18,125 @@ shows whether it is running and its latest log lines; `brain service uninstall` 
 Agent directories moved with the variables below are carried into the service when it is
 installed. To run it in a terminal instead, use `brain watch`.
 
+## Nix
+
+The flake supports `x86_64-linux` and `aarch64-linux`, on NixOS or other Linux distributions
+with Nix installed. It supplies Python 3.14 and all required libraries; no system Python,
+`uv`, or virtual environment is needed. Enable `nix-command` and `flakes` in your Nix
+configuration (on NixOS: `nix.settings.experimental-features = [ "nix-command" "flakes" ];`).
+
+### Run or install
+
+```sh
+# From a checkout:
+nix run . -- --help
+nix run . -- index
+nix build .                         # result/bin/brain
+
+# Directly from GitHub (once the flake is published):
+nix run github:thehumanworks/brain -- search rate limiting
+nix profile add github:thehumanworks/brain
+```
+
+Both `packages.<system>.default` and `packages.<system>.brain` expose the application;
+`apps.<system>.default` and `apps.<system>.brain` expose the CLI. Use `nix shell .` for a
+temporary shell with the packaged `brain` on PATH. `nix profile add .` installs a local
+checkout instead of the GitHub version.
+
+### Home Manager or NixOS
+
+Add this input to your configuration's `flake.nix`:
+
+```nix
+inputs.brain.url = "github:thehumanworks/brain";
+```
+
+Pass your flake's `inputs` to modules with `extraSpecialArgs = { inherit inputs; };` for
+standalone Home Manager, `specialArgs = { inherit inputs; };` for NixOS, or
+`home-manager.extraSpecialArgs = { inherit inputs; };` for Home Manager inside NixOS.
+Then install it in a Home Manager module:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  home.packages = [ inputs.brain.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+}
+```
+
+Or install it system-wide in a NixOS module:
+
+```nix
+{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [ inputs.brain.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+}
+```
+
+No overlay or module is required for package-only installation. The package uses the nixpkgs revision pinned in
+this repository's `flake.lock`, independently of your system's Python version. You can set
+`inputs.brain.inputs.nixpkgs.follows = "nixpkgs";` to share your configuration's nixpkgs,
+but that revision must provide `python314Packages` and the other APIs used by the flake.
+
+### Background indexing with Home Manager
+
+Import the flake's Home Manager module instead of using `brain service install` or writing
+a service by hand. With `inputs` passed to your Home Manager configuration as above:
+
+```nix
+{ inputs, ... }:
+{
+  imports = [ inputs.brain.homeManagerModules.default ];
+
+  services.brain = {
+    enable = true;
+    pollInterval = 30; # seconds; default is 5
+
+    # Optional: use absolute paths for non-default transcript/index locations.
+    # environment = {
+    #   CODEX_HOME = "/home/alice/custom-codex";
+    #   BRAIN_DB = "/home/alice/.local/share/brain/index.db";
+    # };
+  };
+}
+```
+
+`homeManagerModules.brain` is an alias for the same module. This is a **Home Manager**
+module, usable both standalone and inside NixOS; import it into the Home Manager user's
+configuration, not directly into NixOS's system modules.
+
+| Option | Default | Purpose |
+|---|---|---|
+| `services.brain.enable` | `false` | Install the CLI and enable the systemd user watcher. |
+| `services.brain.pollInterval` | `5` | Positive integer seconds between scans and incremental index updates. |
+| `services.brain.package` | This flake's package | Override the package installed and run by the service. |
+| `services.brain.environment` | `{}` | Environment variables for custom transcript paths or `BRAIN_DB`. |
+
+The watcher indexes immediately on startup, then polls at the configured interval. Each
+poll updates changed transcripts; unchanged files are skipped. Scans never overlap. There
+is no separate full-rebuild schedule: rebuilding from scratch could lose indexed history
+whose original transcripts have been deleted. Environment values are literal (no `$HOME`
+or `~` expansion) and stored in the Nix store, so do not put secrets in them.
+
+The service runs at low CPU/I/O priority, starts at login, and restarts after 30 seconds if
+it exits. The module defaults `systemd.user.startServices` to `"sd-switch"` so Home Manager
+starts or restarts it when you apply changes, including package or interval updates. An
+explicit `systemd.user.startServices = false;` (or `"suggest"`) is respected if you prefer
+manual service management. The executable remains in the Nix closure across garbage
+collection.
+
+If you previously installed the service imperatively, run `brain service uninstall` before
+switching to Home Manager. If you used the earlier hand-written Home Manager service
+example, replace it with this module rather than keeping both service definitions.
+Once managed declaratively, use `systemctl --user status brain` and
+`journalctl --user -u brain`, not `brain service install/uninstall`. The service runs as
+the logged-in user, not root; it needs a systemd user manager (including on WSL). Configure
+user lingering separately if it should run while logged out.
+
+Without Home Manager, install the CLI persistently first, then use `brain service install`
+as described above. Do not install the service from a transient `nix run` or `nix shell`:
+its executable may be garbage-collected. Re-run `brain service install` after package
+updates to refresh the executable path.
+
 ## Searching
 
 ```sh
@@ -84,6 +203,29 @@ rebuild from scratch only finds the transcripts still on disk, so keep the index
 sessions whose transcripts are gone.
 
 ## Development
+
+```sh
+nix develop
+python -m brain --help
+python -m unittest discover -s tests -v
+nix fmt
+nix flake check
+```
+
+The development shell uses Python 3.14 and imports `src/` from the checkout, and includes
+`uv` and the Nix formatter. No dependencies are installed into the host system.
+`nix flake check` builds the package, runs the unit tests (including SQLite FTS5 and zstd
+coverage), and smoke-tests the installed CLI with an isolated home directory. It also tests
+the module against the pinned Home Manager input: disabled/enabled defaults, overrides,
+interval validation, environment quoting, and generated unit files. It builds checks for
+the current architecture; testing the other architecture requires a matching builder.
+
+`flake.lock` pins nixpkgs and Home Manager for reproducibility. Home Manager is an input
+for module checks, not a runtime dependency of the CLI. To update them deliberately, run
+`nix flake update nixpkgs home-manager`, then `nix flake check`. When adding files in a Git checkout,
+remember that Nix flakes only include files known to Git.
+
+Without Nix:
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests
