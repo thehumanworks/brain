@@ -6,3 +6,4 @@ dist/
 /result-*
 mise.local.toml
 mise.local.lock
+.DS_Store
