@@ -273,6 +273,8 @@ def cmd_show(args) -> None:
 def cmd_brief(args) -> None:
     if args.hook:
         return hook_brief(args)
+    if not Path(args.db or default_path()).exists():
+        sys.exit(f"no index at {tilde(str(args.db or default_path()))}: run `brain index` first")
     root = project_root(args.path)
     with Brain(args.db, readonly=True) as brain:
         briefs = brain.recent_work(args.path, limit=args.limit, exclude=args.exclude)

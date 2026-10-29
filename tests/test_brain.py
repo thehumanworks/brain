@@ -469,6 +469,14 @@ class BriefTest(Fixture):
         self.assertEqual(self.run_cli("--hook", stdin="not json"), "")
         with mock.patch.dict(os.environ, {"PI_CODING_AGENT": "true"}):  # Pi adds its own
             self.assertEqual(self.run_cli("--hook", stdin=json.dumps(event)), "")
+        missing = self.root / "absent.db"
+        with self.assertRaisesRegex(SystemExit, "no index at .*absent.db: run `brain index` first"):
+            main(["--db", str(missing), "brief"])
+        out = io.StringIO()
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(event))), redirect_stdout(out):
+            main(["--db", str(missing), "brief", "--hook"])
+        self.assertEqual(out.getvalue(), "")
+        self.assertFalse(missing.exists())
 
 
 class LayeringTest(unittest.TestCase):
