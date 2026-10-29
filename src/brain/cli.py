@@ -23,7 +23,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--db", type=Path, help="index file (default: $BRAIN_DB or "
                         "~/.local/share/brain/index.db)")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+    parser.set_defaults(func=cmd_tui)
+
+    p = sub.add_parser("tui", help="browse and search interactively (default in a terminal)")
+    p.add_argument("query", nargs="*", help="initial search words")
+    add_filters(p)
+    p.add_argument("--all", action="store_true", help="include subagents in recent conversations")
+    p.set_defaults(func=cmd_tui)
 
     p = sub.add_parser("index", help="add new transcript lines to the index, once")
     p.set_defaults(func=cmd_index)
@@ -67,6 +74,8 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(func=cmd_service)
 
     args = parser.parse_args(argv)
+    if args.func is cmd_tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
+        parser.error("interactive browsing requires a terminal; use search/list/show with --json for headless use")
     try:
         args.func(args)
     except KeyboardInterrupt:
@@ -126,6 +135,20 @@ def tilde(path: str | None) -> str:
 
 
 # --- Commands ---------------------------------------------------------------------------------
+
+
+def cmd_tui(args) -> None:
+    # Keep the terminal library out of the startup path for agent/headless commands.
+    from brain.tui import run
+
+    try:
+        since = query.parse_since(args.since) if getattr(args, "since", None) else None
+    except ValueError as exc:
+        raise SystemExit(f"invalid --since: {args.since!r}; use 7d, 12h, 2w or an ISO date") from exc
+    run(args.db or dbmod.default_path(), text=" ".join(getattr(args, "query", [])),
+        filters=query.Filters(agent=getattr(args, "agent", None),
+                              project=getattr(args, "project", None), since=since),
+        subagents=getattr(args, "all", False))
 
 
 def cmd_index(args) -> None:

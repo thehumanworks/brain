@@ -85,7 +85,7 @@
           default = pkgs.mkShell {
             inputsFrom = [ self.packages.${system}.brain ];
             packages = [
-              pkgs.python314
+              (pkgs.python314.withPackages (ps: [ ps.prompt-toolkit ]))
               pkgs.uv
               pkgs.nixfmt
             ];

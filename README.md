@@ -18,6 +18,50 @@ shows whether it is running and its latest log lines; `brain service uninstall` 
 Agent directories moved with the variables below are carried into the service when it is
 installed. To run it in a terminal instead, use `brain watch`.
 
+## Run directly from GitHub with uvx
+
+With [uv](https://docs.astral.sh/uv/getting-started/installation/) and Git installed, you
+can run the CLI without manually cloning the repository, installing `brain` permanently,
+or using Nix:
+
+```sh
+uvx git+https://github.com/thehumanworks/brain --help
+uvx git+https://github.com/thehumanworks/brain index
+uvx git+https://github.com/thehumanworks/brain search rate limiting
+uvx git+https://github.com/thehumanworks/brain watch --interval 30
+```
+
+Arguments after the repository URL go directly to `brain`. uv builds and caches the
+application in an isolated environment. Python 3.14+ is required; uv can download a suitable
+Python when needed unless automatic downloads are disabled. To select it explicitly:
+
+```sh
+uvx --python 3.14 git+https://github.com/thehumanworks/brain --help
+```
+
+The index is persistent even though the tool environment is temporary: it uses the same
+`~/.local/share/brain/index.db` and transcript locations as any other installation. Use
+`--db /absolute/path/index.db` before a subcommand to choose a different index.
+
+To refresh a cached GitHub checkout, or pin a particular revision:
+
+```sh
+uvx --refresh git+https://github.com/thehumanworks/brain --help
+uvx "git+https://github.com/thehumanworks/brain@<commit-or-tag>" --help
+```
+
+For a background service, install persistently rather than calling `service install`
+through `uvx`, whose cached executable may be removed during cache cleanup:
+
+```sh
+uv tool install git+https://github.com/thehumanworks/brain
+brain service install
+```
+
+If `brain` is not on PATH after installation, run `uv tool update-shell` and open a new
+shell. The existing `pyproject.toml` provides the `brain` console entry point; no PyPI
+publication is required.
+
 ## Nix
 
 The flake supports `x86_64-linux` and `aarch64-linux`, on NixOS or other Linux distributions
@@ -33,7 +77,7 @@ nix run . -- --help
 nix run . -- index
 nix build .                         # result/bin/brain
 
-# Directly from GitHub (once the flake is published):
+# Directly from GitHub:
 nix run github:thehumanworks/brain -- search rate limiting
 nix profile add github:thehumanworks/brain
 ```
@@ -137,6 +181,60 @@ as described above. Do not install the service from a transient `nix run` or `ni
 its executable may be garbage-collected. Re-run `brain service install` after package
 updates to refresh the executable path.
 
+## Interactive browsing
+
+For humans, `brain tui` provides a keyboard-driven browser without copying session or
+message IDs. Bare `brain` opens the same browser when both input and output are terminals.
+Agent-facing commands and their `--json` output are unchanged; piped/no-terminal calls
+without a subcommand fail with usage guidance instead of waiting for interactive input.
+
+```sh
+brain                                      # recent conversations, newest first
+brain tui                                  # explicit interactive command
+brain tui rate limiting --agent codex --project api --since 7d
+brain --db /path/to/index.db tui
+uvx git+https://github.com/thehumanworks/brain tui
+nix run . -- tui
+```
+
+The list shows conversation titles, agent, date, project path, and search snippets. Type a
+query and press **Enter** to search; select a result and press **Enter** again to read it.
+Search results open at the exact matched message with surrounding context, not just at
+the beginning of a session. Clear the query and press Enter to return to recent conversations.
+The Project field filters by path substring. Search uses the same literal words, quoted
+phrases, and prefixes as `brain search`; it is submitted with Enter, not on every keystroke.
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift-Tab` | Move between search, project filter, and results/conversation. |
+| `↑` / `↓`, `Page Up` / `Page Down` | Select results or scroll the conversation. |
+| `/` in results | Focus the search field. |
+| `Enter` | Submit a search/filter, or open the selected result. |
+| `Esc` | Return to results, preserving the query and selection; in results, focus search. |
+| `F2` | Cycle the agent filter: all, Claude, Codex, Pi. |
+| `m` in results | Load another 100 results when more are available. |
+| `F3` in the conversation | Hide/show tool calls and output; a matched tool message stays visible. |
+| `F6` / `F7` in the conversation | Previous/next page of messages. |
+| `F5` | Refresh from the index, including updates made by `brain watch`. |
+| `Ctrl-Q` / `Ctrl-C` | Quit. |
+
+Recent conversations omit subagents by default (`brain tui --all` includes them); search
+can find their messages. Search shows up to two hits per session; opening one lets you
+page through the conversation. Results load in batches of 100, and conversations in pages
+of 30 messages. Messages are not shortened in the reader beyond the index's existing 64 KiB
+per-message cap.
+
+The browser is **read-only**: run `brain index` first or keep `brain watch` running separately.
+`F5` reloads the database, not the transcript files. Empty, missing, or temporarily locked
+indexes produce guidance in the UI and can be retried without restarting it. SQLite work
+runs off the UI event loop, cancelled searches are interrupted, and obsolete results cannot
+overwrite a newer search. Transcript text is rendered literally, with terminal control
+sequences neutralized.
+
+The TUI uses [prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/): a lightweight
+terminal library with Unicode, wrapping, keyboard handling, and headless input testing.
+It is imported only when opening the browser, so CLI startup for agents stays lean.
+
 ## Searching
 
 ```sh
@@ -215,7 +313,13 @@ nix flake check
 The development shell uses Python 3.14 and imports `src/` from the checkout, and includes
 `uv` and the Nix formatter. No dependencies are installed into the host system.
 `nix flake check` builds the package, runs the unit tests (including SQLite FTS5 and zstd
-coverage), and smoke-tests the installed CLI with an isolated home directory. It also tests
+coverage), and smoke-tests the installed CLI with an isolated home directory. TUI tests
+use actual key sequences through prompt_toolkit's pipe input and real SQLite/FTS fixtures:
+search-to-message navigation, wrapped-paragraph scrolling, paging, filters, refresh, error
+recovery, stale-request races, read-only access, and headless CLI compatibility. A POSIX
+pseudo-terminal test also launches bare `brain`, searches, opens a hit, and checks terminal
+restoration on exit. Tests never open your personal index.
+The flake also tests
 the module against the pinned Home Manager input: disabled/enabled defaults, overrides,
 interval validation, environment quoting, and generated unit files. It builds checks for
 the current architecture; testing the other architecture requires a matching builder.
@@ -228,7 +332,8 @@ remember that Nix flakes only include files known to Git.
 Without Nix:
 
 ```sh
-PYTHONPATH=src python3 -m unittest discover -s tests
+uv run python -m unittest discover -s tests -v
 ```
 
-Requires Python 3.14+ (for `compression.zstd`); no other dependencies.
+Requires Python 3.14+ (for `compression.zstd`) and `prompt-toolkit` 3.x. Both the Python
+package metadata and Nix package declare the terminal dependency.

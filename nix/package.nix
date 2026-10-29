@@ -21,16 +21,18 @@ python314Packages.buildPythonApplication {
   };
 
   build-system = [ python314Packages.hatchling ];
+  dependencies = [ python314Packages.prompt-toolkit ];
 
   doCheck = true;
   checkPhase = ''
     runHook preCheck
-    PYTHONPATH=src python -m unittest discover -s tests -v
+    PYTHONPATH="src:$PYTHONPATH" python -m unittest discover -s tests -v
     runHook postCheck
   '';
 
   pythonImportsCheck = [
     "brain.cli"
+    "brain.tui"
     "compression.zstd"
     "sqlite3"
   ];
