@@ -1,5 +1,6 @@
 {
   lib,
+  git,
   python314Packages,
 }:
 let
@@ -24,6 +25,7 @@ python314Packages.buildPythonApplication {
   dependencies = [ python314Packages.prompt-toolkit ];
 
   doCheck = true;
+  nativeCheckInputs = [ git ];
   checkPhase = ''
     runHook preCheck
     PYTHONPATH="src:$PYTHONPATH" python -m unittest discover -s tests -v
