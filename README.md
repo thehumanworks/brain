@@ -269,6 +269,16 @@ home.file.".pi/agent/extensions/brain-brief.ts".source =
   "${config.programs.brain.package}/share/brain/pi/brain-brief.ts";
 ```
 
+**Coming from 0.2.0** with `enableClaudeIntegration`, `enableCodexIntegration` or
+`enablePiIntegration` set: remove them, since a configuration that still sets one fails with
+this advice, then run `brain install --claude --codex --pi` after the switch. A file Home
+Manager wrote only because of those options (`~/.claude/settings.json`, `~/.codex/hooks.json`,
+`~/.codex/config.toml`, the Pi extension) goes at that switch; if Home Manager kept a backup
+of yours when it took the file over (`home-manager.backupFileExtension`), move it back first.
+A hook that 0.2.0's activation step wrote names brain's store path, which garbage collection
+removes after an update: `brain install --check` then reports it as out of date, and
+`brain install --claude --codex --pi` points it at the profile.
+
 ## Interactive browsing
 
 For humans, `brain tui` provides a keyboard-driven browser without copying session or
