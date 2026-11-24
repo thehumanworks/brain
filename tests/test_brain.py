@@ -6,9 +6,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from compression import zstd
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -471,11 +472,81 @@ class BriefTest(Fixture):
             self.assertEqual(self.run_cli("--hook", stdin=json.dumps(event)), "")
         missing = self.root / "absent.db"
         with self.assertRaisesRegex(SystemExit, "no index at .*absent.db: run `brain index` first"):
-            main(["--db", str(missing), "brief"])
+            main(["--db", str(missing), "brief", str(self.proj)])
         out = io.StringIO()
         with mock.patch("sys.stdin", io.StringIO(json.dumps(event))), redirect_stdout(out):
             main(["--db", str(missing), "brief", "--hook"])
         self.assertEqual(out.getvalue(), "")
+        self.assertFalse(missing.exists())
+
+    def handover(self, top: Path, session: str, age: int) -> Path:
+        """A handover file a session left in a checkout, written `age` minutes ago."""
+        path = top / ".agents" / "brain" / f"{session}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# Handover of {session}\n")
+        written = time.time() - age * 60
+        os.utime(path, (written, written))
+        return path
+
+    def test_handover_files_are_found_last_written_first(self):
+        self.assertEqual(brain.handovers(self.proj), [])
+        old = self.handover(self.proj, "s-old", 90)
+        new = self.handover(self.proj, "s-new", 5)
+        (self.proj / ".agents" / "brain" / "notes.txt").write_text("not a handover")
+        (self.proj / ".agents" / "brain" / "folder.md").mkdir()
+        self.assertEqual(brain.handovers(self.proj), [new, old])
+        self.assertEqual(brain.handovers(self.proj / ".git"), [new, old])  # from anywhere in it
+        # A worktree has its own and, since git does not carry them, the main checkout's.
+        mine = self.handover(self.wt, "s-wt", 30)
+        self.assertEqual(brain.handovers(self.wt), [new, mine, old])
+        self.assertEqual(brain.handovers(self.proj), [new, old])
+        # The session that asks is not handed its own, nor one it names.
+        self.assertEqual(brain.handovers(self.proj, exclude=["s-new", None]), [old])
+        with mock.patch.dict(os.environ, {"CODEX_THREAD_ID": "s-new"}):
+            self.assertEqual(brain.handovers(self.proj), [old])
+        self.assertEqual(brain.handovers(self.root.resolve() / "elsewhere"), [])
+
+    def test_brief_names_the_latest_handover_first(self):
+        old = self.handover(self.proj, "s-old", 180)
+        text = self.run_cli(str(self.proj))
+        first, blank, sessions = text.splitlines()[:3]
+        self.assertEqual(first, f"Handover from an earlier session: {old}, written 3 hours ago. Read "
+                                "it before the code: it says what is finished, what is open and what "
+                                "the user is waiting on, as of when it was written.")
+        self.assertEqual(blank, "")
+        self.assertIn("newest first", sessions)
+        new = self.handover(self.proj, "s-new", 2)
+        first = self.run_cli(str(self.proj)).splitlines()[0]
+        self.assertIn(f"{new}, written 2 minutes ago.", first)
+        self.assertTrue(first.endswith("as of when it was written. 1 older beside it."))
+        self.assertEqual(json.loads(self.run_cli(str(self.proj), "--json"))["handover"], str(new))
+        self.assertIsNone(json.loads(self.run_cli(str(self.root.resolve() / "elsewhere"), "--json"))["handover"])
+        # Left out for the session that wrote it: named with --exclude, or the one a hook starts.
+        self.assertIn(f"{old}, written", self.run_cli(str(self.proj), "--exclude", "s-new").splitlines()[0])
+        event = {"session_id": "s-new", "cwd": str(self.wt), "source": "startup"}
+        hook = self.run_cli("--hook", stdin=json.dumps(event))
+        self.assertIn(f"{old}, written", hook.splitlines()[0])
+        self.assertIn("newest first", hook.splitlines()[2])
+        self.assertEqual(self.run_cli("--hook", stdin=json.dumps({**event, "source": "resume"})), "")
+
+    def test_a_handover_is_named_where_there_is_nothing_else_to_tell(self):
+        # A project no session is indexed for, and a machine with no index at all.
+        bare = self.root.resolve() / "bare"
+        (bare / ".git").mkdir(parents=True)
+        left = self.handover(bare, "s-before", 1)
+        line = f"Handover from an earlier session: {left}, written 1 minute ago."
+        text = self.run_cli(str(bare))
+        self.assertTrue(text.startswith(line))
+        self.assertEqual(len(text.splitlines()), 1)
+        missing = self.root / "absent.db"
+        for argv, stdin in ((["brief", str(bare)], ""),
+                            (["brief", "--hook"], json.dumps({"cwd": str(bare), "source": "startup"}))):
+            out = io.StringIO()
+            with mock.patch("sys.stdin", io.StringIO(stdin)), redirect_stdout(out), \
+                    redirect_stderr(io.StringIO()) as err:
+                main(["--db", str(missing), *argv])
+            self.assertTrue(out.getvalue().startswith(line), argv)
+            self.assertEqual("no index at" in err.getvalue(), "--hook" not in argv)
         self.assertFalse(missing.exists())
 
 

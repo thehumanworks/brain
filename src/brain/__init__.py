@@ -13,7 +13,7 @@ loads neither the command line nor its terminal UI.
                 print(message.role, message.text)
 """
 
-from brain.api import Brain, SessionRef, Since, project_root
+from brain.api import Brain, SessionRef, Since, handovers, project_root
 from brain.db import default_path
 from brain.errors import AmbiguousSession, BrainError, IndexFormatError, SessionNotFound
 from brain.models import (AgentStats, Brief, Commit, Hit, IndexResult, Message, MessagePage,
@@ -40,6 +40,7 @@ __all__ = [
     "Since",
     "Stats",
     "default_path",
+    "handovers",
     "parse_since",
     "project_root",
     "short_id",

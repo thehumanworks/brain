@@ -65,6 +65,25 @@ def checkout(path: str | Path) -> tuple[Path, Path]:
     return path, path
 
 
+# Where a session leaves what the next one should know: a file a session, named for it.
+HANDOVERS = Path(".agents") / "brain"
+
+
+def handovers(path: str | Path, exclude: list[str]) -> list[Path]:
+    """The handover files of `path`'s project, last written first: `.agents/brain/*.md` in its
+    checkout and in its main checkout, which is where a worktree's are when git does not track
+    them. Those named for a session in `exclude` are left out."""
+    written = {}
+    for top in dict.fromkeys(checkout(path)):
+        try:
+            for file in (top / HANDOVERS).glob("*.md"):
+                if file.stem not in exclude and file.is_file():
+                    written[file] = file.stat().st_mtime
+        except OSError:
+            continue
+    return sorted(written, key=written.get, reverse=True)
+
+
 def project_cwds(db: sqlite3.Connection, here: Path, root: Path) -> list[str]:
     """The working directories of the sessions in a project, from its checkout `here` and main
     checkout `root`: the checkouts and what is below them, such as worktrees, and directories of

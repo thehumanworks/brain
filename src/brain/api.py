@@ -24,6 +24,14 @@ def project_root(path: str | Path = ".") -> Path:
     return briefmod.checkout(path)[1]
 
 
+def handovers(path: str | Path = ".", *, exclude: Iterable[str | None] = ()) -> list[Path]:
+    """The handover files of `path`'s project, last written first: what earlier sessions left
+    in `.agents/brain/<session id>.md` for the next one to start from, in the checkout `path` is
+    in and in its main checkout. Left out are the file of the session this process runs in and
+    of any session id in `exclude`. No index is needed."""
+    return briefmod.handovers(path, [*filter(None, exclude), *briefmod.current_sessions()])
+
+
 def since_ms(value: Since | None) -> int | None:
     if value is None or isinstance(value, int):
         return value

@@ -334,6 +334,20 @@ b707f78f · claude · 19 days ago · in .claude/worktrees/openai-login · "Opena
   …
 ```
 
+- **A handover comes first**, where the project has one. A session can leave the next one a
+  file, `.agents/brain/<session id>.md` in the project: what is finished, what is open, what
+  the user is waiting on. The brief then starts with where the last written one is, before
+  the sessions:
+
+  ```text
+  Handover from an earlier session: ~/projects/tny/.agents/brain/6a1db4cf-….md, written 2 hours ago. Read it before the code: it says what is finished, what is open and what the user is waiting on, as of when it was written. 3 older beside it.
+  ```
+
+  `brain` only points at the file; writing it is up to the session. A worktree also sees the
+  main checkout's files, which is where they are when git does not track them. The file of
+  the session that asks is left out, as is one named with `--exclude`. The line needs no
+  index, so it is there on a machine where nothing is indexed yet. `--json` has the path as
+  `handover`.
 - **The project** is the git repository the directory is in, from its main checkout, so a
   worktree's brief includes the main checkout's sessions and the other way round. Sessions in
   directories of the project's name that no longer exist count too: where the project was before
@@ -406,6 +420,8 @@ and run `uv run script.py`:
 | `brief(session)` | `Brief` | |
 | `stats()` | `Stats` | `brain stats` |
 
+- `brain.handovers(path=".", exclude=())` is a function, not a method, since it needs no
+  index: the project's handover files as a `list[Path]`, last written first.
 - Queries and filters work as on the command line. `since` also takes a `datetime` or unix
   milliseconds, and a session is a `Session`, a `Hit` or an id as `brain show` takes it.
 - Results are frozen dataclasses; `dataclasses.asdict` gives the objects `--json` prints.
@@ -438,7 +454,8 @@ start with a brief of the latest ones in its project.
 
 ### A brief at the start of every session
 
-Each agent can start a new session with `brain brief` for its project. Only sessions someone
+Each agent can start a new session with `brain brief` for its project: where its latest
+handover is, if it has one, and what its latest sessions did. Only sessions someone
 starts count: not resumed or compacted ones, `claude -p` and Agent SDK runs, or Pi's print
 mode, bots and workflows. If `brain` fails, the session starts without a brief.
 
