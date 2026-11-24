@@ -57,6 +57,46 @@ let
     "enablePiIntegration"
   ];
   fails = extra: !(builtins.tryEval (evaluate extra).programs.brain.enable).success;
+
+  withHooks =
+    extra:
+    configuration {
+      imports = [
+        {
+          programs.brain = {
+            enable = true;
+            installHooks = true;
+          };
+        }
+        extra
+      ];
+    };
+  # No agent configured by Home Manager: each is chosen by its directory at the switch.
+  hooksAlone = withHooks { };
+  # Each agent configured, Claude Code and Codex with settings Home Manager merges into theirs.
+  hooksWithAgents = withHooks {
+    programs.claude-code = {
+      enable = true;
+      package = null;
+      mutableSettings = true;
+      settings.theme = "dark";
+    };
+    programs.codex = {
+      enable = true;
+      package = null;
+      mutableSettings = true;
+      settings.model = "gpt-5";
+    };
+    programs.pi-coding-agent = {
+      enable = true;
+      package = null;
+    };
+  };
+  hooksWithDb = withHooks { programs.brain.environment.BRAIN_DB = "/home/brain-test/b.db"; };
+  hookStep = configuration: configuration.config.home.activation.brainHooks;
+  profileBin = "${hooksAlone.config.home.profileDirectory}/bin";
+  # The step's text without the store paths' context, which `hasInfix` cannot match against.
+  hookText = configuration: builtins.unsafeDiscardStringContext (hookStep configuration).data;
   replacement = pkgs.writeShellScriptBin "brain" "exit 0";
   customized = evaluate {
     programs.brain = {
@@ -173,6 +213,59 @@ let
       ) removedIntegrations;
       expected = map (_: true) removedIntegrations;
     };
+    testInstallHooksRunsAfterHomeManagersOwnWrites = {
+      expr = (hookStep hooksAlone).after;
+      expected = [
+        "writeBoundary"
+        "linkGeneration"
+        "installPackages"
+        "claudeCodeSettings"
+        "codexMutableSettings"
+      ];
+    };
+    testInstallHooksNamesTheProfile = {
+      expr = {
+        inProfile = lib.hasInfix "PATH=${lib.escapeShellArg profileBin}:" (hookText hooksAlone);
+        inStore = lib.hasPrefix builtins.storeDir profileBin;
+      };
+      expected = {
+        inProfile = true;
+        inStore = false;
+      };
+    };
+    testInstallHooksTakesConfiguredAgents = {
+      expr = map (line: lib.hasInfix line (hookText hooksWithAgents)) [
+        "if true; then brainHooks+=(--claude); fi"
+        "if true; then brainHooks+=(--codex); fi"
+        "if true && ! [[ $(realpath -m ${lib.escapeShellArg "/home/brain-test/.pi/agent/extensions/brain-brief.ts"}) == ${builtins.storeDir}/* ]]; then brainHooks+=(--pi); fi"
+      ];
+      expected = [
+        true
+        true
+        true
+      ];
+    };
+    testInstallHooksUsesTheIndex = {
+      expr = lib.hasInfix (lib.concatStringsSep " " [
+        (lib.escapeShellArg "BRAIN_DB=/home/brain-test/b.db")
+        (builtins.unsafeDiscardStringContext exe)
+        "--db"
+        (lib.escapeShellArg "/home/brain-test/b.db")
+      ]) (hookText hooksWithDb);
+      expected = true;
+    };
+    testInstallHooksLeavesAgentsFilesAlone = {
+      expr = lib.filter (
+        target:
+        lib.elem target [
+          ".claude/settings.json"
+          ".codex/config.toml"
+          ".codex/hooks.json"
+        ]
+        || lib.hasSuffix "brain-brief.ts" target
+      ) (targets hooksWithAgents.config);
+      expected = [ ];
+    };
     testIntervalValidation = {
       expr = map acceptsInterval [
         0
@@ -202,4 +295,47 @@ pkgs.runCommand "brain-home-manager-check" { } ''
   grep -Fx ${lib.escapeShellArg "ExecStart=${lib.getExe brain} watch --interval 5"} "$out/default.service"
   grep -Fx ${lib.escapeShellArg "ExecStart=${lib.getExe replacement} watch --interval 30"} "$out/custom.service"
   grep -Fx 'WantedBy=default.target' "$out/default.service"
+
+  # brain's step comes after Home Manager's merges into the agents' settings, in the real
+  # activation script, and one without those steps still builds.
+  activate=${hooksWithAgents.activationPackage}/activate
+  test -e ${hooksAlone.activationPackage}/activate
+  line() { grep -nF -m1 "$1" "$activate" | cut -d: -f1; }
+  test "$(line '"claudeCodeSettings"')" -lt "$(line 'brainHooks=()')"
+  test "$(line '"codexMutableSettings"')" -lt "$(line 'brainHooks=()')"
+
+  # The step itself, as the activation script runs it, in a home of its own.
+  export HOME=$PWD/home
+  profile=$(sed "s|^/home/brain-test|$HOME|" <<< ${lib.escapeShellArg profileBin})
+  mkdir -p "$profile" "$HOME/.claude" "$HOME/.codex" "$HOME/.pi/agent/extensions"
+  ln -s ${exe} "$profile/brain"
+  # Pi's extension as the README's `home.file` line links it.
+  ln -s ${brain}/share/brain/pi/brain-brief.ts "$HOME/.pi/agent/extensions/brain-brief.ts"
+  sed "s|/home/brain-test|$HOME|g" ${pkgs.writeText "brain-hooks" (hookStep hooksAlone).data} > hooks.sh
+  run() { "$@"; }
+  warnEcho() { echo "warning: $*"; }
+  set -euo pipefail
+
+  source ./hooks.sh > first.txt 2>&1
+  cat first.txt
+  grep -Fx 'claude   added the SessionStart hook in ~/.claude/settings.json' first.txt
+  grep -Fx 'codex    added the SessionStart hook in ~/.codex/hooks.json' first.txt
+  if grep '^pi ' first.txt; then exit 1; fi
+  test -L "$HOME/.pi/agent/extensions/brain-brief.ts"
+  grep -F "\"$profile/brain brief --hook\"" "$HOME/.claude/settings.json"
+  grep -F "\"$profile/brain brief --hook\"" "$HOME/.codex/hooks.json"
+
+  source ./hooks.sh > second.txt 2>&1
+  test ! -s second.txt
+
+  # A settings file another tool keeps read-only: a warning, and the switch carries on.
+  mkdir kept
+  echo '{}' > kept/settings.json
+  chmod a-w kept kept/settings.json
+  ln -sf "$PWD/kept/settings.json" "$HOME/.claude/settings.json"
+  source ./hooks.sh > third.txt 2>&1
+  cat third.txt
+  grep -F 'claude   failed: cannot write ~/.claude/settings.json' third.txt
+  grep -F 'warning: brain: a hook is not set up' third.txt
+  chmod u+w kept
 ''

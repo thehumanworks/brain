@@ -181,6 +181,7 @@ configuration, not directly into NixOS's system modules.
 | `programs.brain.pollInterval` | `5` | Positive integer seconds between scans and incremental index updates. |
 | `programs.brain.package` | This flake's package | Override the package installed and run by the service. |
 | `programs.brain.environment` | `{}` | Environment variables for custom transcript paths or `BRAIN_DB`. |
+| `programs.brain.installHooks` | `false` | Run `brain install` for Claude Code, Codex and Pi at every switch; see below. |
 
 The options were `services.brain.*` before 0.2.0. The old names still work, with a warning
 that names the new one.
@@ -215,22 +216,42 @@ the hooks name the executable by its full path, which may be garbage-collected. 
 
 ### Agent hooks with Home Manager
 
-The module leaves the agents' settings alone. Claude Code and Codex write their own settings
-files (the model you pick, a permission you grant, the hooks you trust in Codex), so a file
-Home Manager wrote would either replace yours or be one they cannot write. Add the hooks with
-`brain install` once, after the first switch:
+The module never writes the agents' settings files. Claude Code and Codex write their own
+(the model you pick, a permission you grant, the hooks you trust in Codex), so a file Home
+Manager wrote would either replace yours or be one they cannot write. Instead, `installHooks`
+runs `brain install` at every switch, which adds brain's hook to the files as they are:
 
-```sh
-brain install --claude --codex --pi
+```nix
+programs.brain = {
+  enable = true;
+  installHooks = true;
+};
 ```
 
-It adds the hook to `~/.claude/settings.json` and `~/.codex/hooks.json` and the extension to
-`~/.pi/agent/extensions`, leaving the rest of each file as it is. It names `brain` by where it
-is found on `PATH`, which under Home Manager is the profile (`/etc/profiles/per-user/<you>/bin`
-or `~/.nix-profile/bin`), not the store, so the hooks keep working across updates and Codex
-keeps its trust in them. With `BRAIN_DB` in `environment`, pass the same path:
-`brain --db <path> install --claude --codex --pi`. `brain install --check` shows what is set
-up; Codex runs a new hook only once you trust it with `/hooks`.
+The first switch prints what it set up:
+
+```text
+claude   added the SessionStart hook in ~/.claude/settings.json
+codex    added the SessionStart hook in ~/.codex/hooks.json
+         turned hooks on in ~/.codex/config.toml
+         Codex runs a new hook only once you trust it: review it with /hooks in Codex
+pi       wrote ~/.pi/agent/extensions/brain-brief.ts
+```
+
+Later switches print nothing unless something changed, so a hook removed by hand comes back at
+the next switch. It sets up each agent Home Manager configures (`programs.claude-code`,
+`programs.codex`, `programs.pi-coding-agent`) and each whose directory exists (`~/.claude`,
+`~/.codex`, `~/.pi/agent`, or the ones `environment` names), and gives the hook the `BRAIN_DB`
+from `environment`. It runs after Home Manager's own merges into the agents' settings
+(`mutableSettings`), whose `SessionStart` list would otherwise replace the one holding brain's
+hook. A file it cannot write gives a warning, and the switch carries on.
+
+The hooks name `brain` in the profile (`/etc/profiles/per-user/<you>/bin` or
+`~/.nix-profile/bin`), not in the store, so they keep working across updates and Codex keeps
+its trust in them. Turning `installHooks` off leaves them in place: remove them with
+`brain uninstall --claude --codex --pi`. Without `installHooks`, run
+`brain install --claude --codex --pi` once after the first switch, with `--db <path>` before
+`install` when `environment` sets `BRAIN_DB`. `brain install --check` shows what is set up.
 
 If Home Manager writes an agent's settings (`programs.claude-code.settings`,
 `programs.codex.hooks`), declare the hook there instead: `brain install` cannot change a file
@@ -262,7 +283,8 @@ has to stay writable: leave `programs.codex.settings` empty or set
 `programs.codex.mutableSettings = true`. Linked from the store, it cannot hold that trust.
 
 Pi does not write its extensions directory, so its extension can be linked declaratively
-instead of with `brain install --pi`:
+instead of with `brain install --pi`; `installHooks` leaves an extension linked this way as it
+is:
 
 ```nix
 home.file.".pi/agent/extensions/brain-brief.ts".source =
@@ -271,13 +293,14 @@ home.file.".pi/agent/extensions/brain-brief.ts".source =
 
 **Coming from 0.2.0** with `enableClaudeIntegration`, `enableCodexIntegration` or
 `enablePiIntegration` set: remove them, since a configuration that still sets one fails with
-this advice, then run `brain install --claude --codex --pi` after the switch. A file Home
+this advice, and set `installHooks = true` instead. A file Home
 Manager wrote only because of those options (`~/.claude/settings.json`, `~/.codex/hooks.json`,
 `~/.codex/config.toml`, the Pi extension) goes at that switch; if Home Manager kept a backup
 of yours when it took the file over (`home-manager.backupFileExtension`), move it back first.
 A hook that 0.2.0's activation step wrote names brain's store path, which garbage collection
 removes after an update: `brain install --check` then reports it as out of date, and
-`brain install --claude --codex --pi` points it at the profile.
+the next switch with `installHooks` (or `brain install --claude --codex --pi`) points it at
+the profile.
 
 ## Interactive browsing
 
