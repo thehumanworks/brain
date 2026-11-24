@@ -48,6 +48,12 @@ def status() -> None:
     {"Darwin": launchd_status, "Linux": systemd_status}.get(platform.system(), unsupported)()
 
 
+def installed_path() -> Path | None:
+    """The file that makes the service run from login on, if it is there."""
+    path = {"Darwin": plist_path, "Linux": unit_path}.get(platform.system())
+    return path() if path and path().exists() else None
+
+
 def unsupported(*_) -> None:
     raise SystemExit(f"no background service for {platform.system()}; run `brain watch` instead")
 

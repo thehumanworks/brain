@@ -71,6 +71,18 @@
             brain stats
             test "$(brain list --json)" = "[]"
             test "$(brain search smoke-test --json)" = "[]"
+
+            # The installed package carries the Pi extension, and sets the agents up with
+            # its own full path.
+            brain install --claude --codex --pi
+            brain install --check --claude --codex --pi
+            grep -F '"command": "${brain}/bin/brain brief --hook"' "$HOME/.claude/settings.json"
+            grep -F '"command": "${brain}/bin/brain brief --hook"' "$HOME/.codex/hooks.json"
+            grep -Fx 'hooks = true' "$HOME/.codex/config.toml"
+            grep -F '|| "${brain}/bin/brain";' "$HOME/.pi/agent/extensions/brain-brief.ts"
+            cmp "$HOME/.pi/agent/extensions/brain-brief.ts" ${brain}/share/brain/pi/brain-brief.ts
+            brain uninstall --claude --codex --pi
+            ! brain install --check --claude --codex --pi
             touch "$out"
           '';
         }

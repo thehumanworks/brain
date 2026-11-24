@@ -32,6 +32,13 @@ python314Packages.buildPythonApplication {
     runHook postCheck
   '';
 
+  # The Pi extension as `brain install --pi` writes it, for Home Manager to link.
+  postInstall = ''
+    install -Dm444 src/brain/integrations/pi/brain-brief.ts "$out/share/brain/pi/brain-brief.ts"
+    substituteInPlace "$out/share/brain/pi/brain-brief.ts" \
+      --replace-fail '|| "brain";' "|| \"$out/bin/brain\";"
+  '';
+
   pythonImportsCheck = [
     "brain"
     "brain.cli"

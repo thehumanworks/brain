@@ -13,7 +13,7 @@ from pathlib import Path
 
 from brain import (AGENTS, AmbiguousSession, Brain, BrainError, Brief, SessionNotFound,
                    default_path, parse_since, project_root, short_id)
-from brain.cli import service
+from brain.cli import install, service
 
 HOME = str(Path.home())
 TOOL_KINDS = ("tool_call", "tool_result")
@@ -88,6 +88,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("action", choices=["install", "uninstall", "status"])
     p.set_defaults(func=cmd_service)
 
+    p = sub.add_parser("install", help="set brain up here: the background service, the "
+                       "session-start hook for Claude Code and Codex, and the Pi extension")
+    add_parts(p, "set up")
+    p.add_argument("--check", action="store_true", help="change nothing: say what is set up, "
+                   "and exit with status 1 if a part is not")
+    p.add_argument("--quiet", action="store_true", help="say only what changed or failed")
+    p.set_defaults(func=lambda args: install.run(args, "check" if args.check else "install"))
+
+    p = sub.add_parser("uninstall", help="remove what `brain install` set up")
+    add_parts(p, "remove")
+    p.set_defaults(func=lambda args: install.run(args, "uninstall"))
+
     args = parser.parse_args(argv)
     if args.func is cmd_tui and not (sys.stdin.isatty() and sys.stdout.isatty()):
         parser.error("interactive browsing requires a terminal; use search/list/show with --json for headless use")
@@ -99,6 +111,18 @@ def main(argv: list[str] | None = None) -> None:
         sys.stderr.close()
     except BrainError as e:
         sys.exit(str(e))
+
+
+def add_parts(p: argparse.ArgumentParser, verb: str) -> None:
+    """The parts of a setup; with none named, a command takes all of them."""
+    p.add_argument("--service", action="store_true", help=f"{verb} the background service that "
+                   "keeps the index current (`brain service`)")
+    p.add_argument("--claude", action="store_true", help=f"{verb} Claude Code's SessionStart "
+                   "hook, in ~/.claude/settings.json")
+    p.add_argument("--codex", action="store_true", help=f"{verb} Codex's SessionStart hook, in "
+                   "~/.codex/hooks.json")
+    p.add_argument("--pi", action="store_true", help=f"{verb} Pi's extension, in "
+                   "~/.pi/agent/extensions")
 
 
 def add_filters(p: argparse.ArgumentParser, role: bool = False) -> None:

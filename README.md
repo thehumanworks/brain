@@ -7,8 +7,34 @@ through the `brain` command, or from Python as an SDK (see [Scripting](#scriptin
 ```sh
 uv tool install --editable ~/brain   # puts `brain` on your PATH
 brain index                          # first run reads every transcript (a few minutes)
-brain service install                # keep it current in the background, from every login on
+brain install                        # keep it current in the background, and set your agents up
 ```
+
+`brain install` sets up four parts, and says on a line each what it did:
+
+```
+service  installed ~/Library/LaunchAgents/local.brain.plist
+         brain watch now runs in the background and at every login
+         log: ~/Library/Logs/brain.log
+claude   added the SessionStart hook in ~/.claude/settings.json
+codex    added the SessionStart hook in ~/.codex/hooks.json
+         Codex runs a new hook only once you trust it: review it with /hooks in Codex
+pi       wrote ~/.pi/agent/extensions/brain-brief.ts
+```
+
+- **service**: `brain watch` in the background, from every login on (`brain service install`,
+  below).
+- **claude**, **codex**, **pi**: each agent starts a new session with `brain brief`, the latest
+  earlier sessions in its project (see [A brief at the start of every
+  session](#a-brief-at-the-start-of-every-session)).
+
+Name parts to take only those: `brain install --claude --pi`. With none named, an agent whose
+directory does not exist is left out. Running it again changes nothing, and it leaves the rest
+of each settings file as it is; run it again after moving or updating `brain`, so the hooks
+name it where it now is. `brain install --check` changes nothing and says what is set up,
+with exit status 1 if a part is not. `brain uninstall` takes the same parts and removes them.
+A settings file it cannot write, such as one another tool generates, is reported with what to
+add to it by hand, and the other parts are still set up.
 
 `brain service install` runs `brain watch` as you, at low priority, restarting it if it stops:
 a launchd agent on macOS (`~/Library/LaunchAgents/local.brain.plist`, log in
@@ -122,19 +148,24 @@ this repository's `flake.lock`, independently of your system's Python version. Y
 `inputs.brain.inputs.nixpkgs.follows = "nixpkgs";` to share your configuration's nixpkgs,
 but that revision must provide `python314Packages` and the other APIs used by the flake.
 
-### Background indexing with Home Manager
+### Background indexing and agent setup with Home Manager
 
-Import the flake's Home Manager module instead of using `brain service install` or writing
-a service by hand. With `inputs` passed to your Home Manager configuration as above:
+Import the flake's Home Manager module instead of using `brain install` or writing a service
+by hand. With `inputs` passed to your Home Manager configuration as above:
 
 ```nix
 { inputs, ... }:
 {
   imports = [ inputs.brain.homeManagerModules.default ];
 
-  services.brain = {
-    enable = true;
+  programs.brain = {
+    enable = true; # the CLI and the background watcher
     pollInterval = 30; # seconds; default is 5
+
+    # A brief at the start of every session, for each agent you use:
+    enableClaudeIntegration = true;
+    enableCodexIntegration = true;
+    enablePiIntegration = true;
 
     # Optional: use absolute paths for non-default transcript/index locations.
     # environment = {
@@ -151,10 +182,35 @@ configuration, not directly into NixOS's system modules.
 
 | Option | Default | Purpose |
 |---|---|---|
-| `services.brain.enable` | `false` | Install the CLI and enable the systemd user watcher. |
-| `services.brain.pollInterval` | `5` | Positive integer seconds between scans and incremental index updates. |
-| `services.brain.package` | This flake's package | Override the package installed and run by the service. |
-| `services.brain.environment` | `{}` | Environment variables for custom transcript paths or `BRAIN_DB`. |
+| `programs.brain.enable` | `false` | Install the CLI and enable the systemd user watcher. |
+| `programs.brain.pollInterval` | `5` | Positive integer seconds between scans and incremental index updates. |
+| `programs.brain.package` | This flake's package | Override the package installed and run by the service. |
+| `programs.brain.environment` | `{}` | Environment variables for custom transcript paths or `BRAIN_DB`. |
+| `programs.brain.enableClaudeIntegration` | `false` | Start each Claude Code session with `brain brief`. |
+| `programs.brain.enableCodexIntegration` | `false` | Start each Codex session with `brain brief`. |
+| `programs.brain.enablePiIntegration` | `false` | Start each Pi session with `brain brief`. |
+
+The options were `services.brain.*` before the module set the agents up as well. The old
+names still work, with a warning that names the new one.
+
+How an integration is set up depends on who writes the agent's settings:
+
+- **Home Manager configures the agent** (`programs.claude-code.enable` or
+  `programs.codex.enable`): the SessionStart hook is added to
+  `programs.claude-code.settings` or `programs.codex.hooks`, next to hooks of your own, and
+  for Codex `features.hooks` is turned on in `programs.codex.settings`.
+- **The agent writes its own settings**: `brain install --claude` or `--codex` runs each time
+  the configuration is activated and adds the hook to `~/.claude/settings.json` or
+  `~/.codex/hooks.json`, leaving the rest of the file as it is. It says only what it changed.
+  A file it cannot change gives a warning and does not stop the activation. Turning the
+  option off later does not take the hook out: run `brain uninstall --claude` first.
+- **Pi**: the extension is linked into `~/.pi/agent/extensions`, or into
+  `programs.pi-coding-agent.configDir`, and goes when the option is turned off.
+
+Codex runs a new hook only once you trust it: review it with `/hooks` in Codex after the
+first activation. The integrations follow `environment`: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`
+and `PI_CODING_AGENT_DIR` say where the agents' settings are, and `BRAIN_DB` is passed to
+the hook.
 
 The watcher indexes immediately on startup, then polls at the configured interval. Each
 poll updates changed transcripts; unchanged files are skipped. Scans never overlap. There
@@ -173,14 +229,14 @@ If you previously installed the service imperatively, run `brain service uninsta
 switching to Home Manager. If you used the earlier hand-written Home Manager service
 example, replace it with this module rather than keeping both service definitions.
 Once managed declaratively, use `systemctl --user status brain` and
-`journalctl --user -u brain`, not `brain service install/uninstall`. The service runs as
+`journalctl --user -u brain`, not `brain install` or `brain service install/uninstall`. The service runs as
 the logged-in user, not root; it needs a systemd user manager (including on WSL). Configure
 user lingering separately if it should run while logged out.
 
-Without Home Manager, install the CLI persistently first, then use `brain service install`
-as described above. Do not install the service from a transient `nix run` or `nix shell`:
-its executable may be garbage-collected. Re-run `brain service install` after package
-updates to refresh the executable path.
+Without Home Manager, install the CLI persistently first, then use `brain install` as
+described above. Do not run it from a transient `nix run` or `nix shell`: the service and
+the hooks name the executable by its full path, which may be garbage-collected. Re-run
+`brain install` after package updates to refresh that path.
 
 ## Interactive browsing
 
@@ -386,6 +442,10 @@ Each agent can start a new session with `brain brief` for its project. Only sess
 starts count: not resumed or compacted ones, `claude -p` and Agent SDK runs, or Pi's print
 mode, bots and workflows. If `brain` fails, the session starts without a brief.
 
+`brain install` sets this up for the three agents, and `brain install --claude`, `--codex` or
+`--pi` for one (with Home Manager, the `enable…Integration` options above). What it adds, if
+you would rather add it by hand:
+
 **Claude Code**, in `~/.claude/settings.json` (Pi's claude-bridge provider runs Claude Code
 too; `--hook` leaves those sessions to Pi):
 
@@ -405,7 +465,12 @@ too; `--hook` leaves those sessions to Pi):
 **Codex**, the same entry in `~/.codex/hooks.json` (with `hooks = true` under `[features]` in
 `config.toml`). Codex runs a new hook only once you trust it: review it with `/hooks` in Codex.
 
-**Pi**, with the extension in `integrations/pi`:
+`brain install` writes `brain` by its full path in that command, so the hook does not depend
+on the agent's `PATH`. A hook that already runs the same `brain` under another spelling, such
+as `"$HOME/.local/bin/brain"`, is left as it is.
+
+**Pi**, with the extension in `integrations/pi`, which `brain install --pi` copies with the
+full path of `brain` in it. By hand, from a checkout:
 
 ```sh
 ln -s ~/brain/integrations/pi/brain-brief.ts ~/.pi/agent/extensions/
@@ -458,7 +523,7 @@ nix flake check
 ```
 
 The SDK is `src/brain` (`api.py` holds `Brain`) and the command line is `src/brain/cli`
-(the commands, `tui.py` and `service.py`). The CLI imports only what `brain` exports, which a
+(the commands, `tui.py`, `service.py` and `install.py`). The CLI imports only what `brain` exports, which a
 test enforces, along with the SDK never importing the CLI.
 
 The development shell uses Python 3.14 and imports `src/` from the checkout, and includes
