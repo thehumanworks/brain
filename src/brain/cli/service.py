@@ -18,11 +18,25 @@ PASSED_ENV = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "BRAIN_D
 RESTART_DELAY = 30
 
 
-def watch_command(db: Path | None) -> list[str]:
-    exe = shutil.which("brain")
-    if not exe:
+NIX_STORE = "/nix/store/"
+
+
+def own_path() -> str:
+    """`brain` by the full path that the service and the agents' hooks name: the first on PATH.
+    Nix's wrapper puts the package's own directory first on PATH, a store path that every update
+    changes, so the first `brain` after it that runs the same program from outside the store,
+    such as a Home Manager profile's, is named instead when there is one."""
+    found = [os.path.abspath(path) for path in
+             (shutil.which("brain", path=directory) for directory in os.get_exec_path()) if path]
+    if not found:
         raise SystemExit("`brain` is not on PATH; install it first: uv tool install <path to brain>")
-    return [os.path.abspath(exe), *(["--db", str(db.resolve())] if db else []), "watch"]
+    program = os.path.realpath(found[0])
+    return next((path for path in found
+                 if not path.startswith(NIX_STORE) and os.path.realpath(path) == program), found[0])
+
+
+def watch_command(db: Path | None) -> list[str]:
+    return [own_path(), *(["--db", str(db.resolve())] if db else []), "watch"]
 
 
 def passed_env() -> dict[str, str]:

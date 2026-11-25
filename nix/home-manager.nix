@@ -2,7 +2,6 @@
 {
   config,
   lib,
-  options,
   pkgs,
   ...
 }:
@@ -12,55 +11,59 @@ let
   # but leave $ literal (unlike ExecStart=, Environment= does not expand it).
   quoteEnvironment = value: builtins.toJSON (lib.replaceStrings [ "%" ] [ "%%" ] value);
 
-  # The watcher finds an index that `environment` moves through its unit. A hook runs in the
-  # agent's environment instead, so it has to be told.
-  brain = [
-    (lib.getExe cfg.package)
-  ]
-  ++ lib.optionals (cfg.environment ? BRAIN_DB) [
-    "--db"
-    cfg.environment.BRAIN_DB
+  # The agents `installHooks` sets up: those Home Manager configures, and those whose directory
+  # exists at the switch, as bare `brain install` would choose them.
+  home = config.home.homeDirectory;
+  agents = [
+    {
+      flag = "--claude";
+      module = "claude-code";
+      dir = cfg.environment.CLAUDE_CONFIG_DIR or "${home}/.claude";
+    }
+    {
+      flag = "--codex";
+      module = "codex";
+      dir = cfg.environment.CODEX_HOME or "${home}/.codex";
+    }
+    rec {
+      flag = "--pi";
+      module = "pi-coding-agent";
+      dir = cfg.environment.PI_CODING_AGENT_DIR or "${home}/.pi/agent";
+      # `brain install` replaces a link to the extension with a file, so one that Home Manager
+      # links (the README's `home.file` line) is left to it: the next switch would fail on it.
+      unless = "[[ $(realpath -m ${lib.escapeShellArg "${dir}/extensions/brain-brief.ts"}) == ${builtins.storeDir}/* ]]";
+    }
   ];
-  hook = {
-    matcher = "^(startup|clear)$";
-    hooks = [
-      {
-        type = "command";
-        command = "${lib.escapeShellArgs brain} brief --hook";
-        timeout = 5;
-      }
-    ];
-  };
-
-  # An agent that Home Manager configures gets the hook through that module's own options.
-  # Otherwise the agent's settings are a file the agent itself writes, and `brain install`
-  # adds the hook to it when the configuration is activated.
-  managed = name: options.programs ? ${name} && config.programs.${name}.enable;
-  claudeManaged = managed "claude-code";
-  codexManaged = managed "codex";
-  installed =
-    lib.optional (cfg.enableClaudeIntegration && !claudeManaged) "--claude"
-    ++ lib.optional (cfg.enableCodexIntegration && !codexManaged) "--codex";
-
-  piDirectory =
-    cfg.environment.PI_CODING_AGENT_DIR or (
-      if managed "pi-coding-agent" then
-        config.programs.pi-coding-agent.configDir
-      else
-        "${config.home.homeDirectory}/.pi/agent"
-    );
-
-  integration =
-    agent: how:
-    lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = ''
-        Whether to start each ${agent} session someone starts with
-        {command}`brain brief`: the latest earlier sessions in its project.
-        ${how}
-      '';
-    };
+  chooseAgent =
+    agent:
+    let
+      used =
+        if config.programs.${agent.module}.enable or false then
+          "true"
+        else
+          "[[ -d ${lib.escapeShellArg agent.dir} ]]";
+      unless = lib.optionalString (agent ? unless) " && ! ${agent.unless}";
+    in
+    "if ${used}${unless}; then brainHooks+=(${agent.flag}); fi";
+  # The hooks name the profile's `brain`, which updates leave in place, rather than the store
+  # path: Codex would ask to trust the hook again after every update.
+  profileBin = lib.escapeShellArg "${config.home.profileDirectory}/bin";
+  environment = lib.escapeShellArgs (
+    lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment
+  );
+  index = lib.optionalString (
+    cfg.environment ? BRAIN_DB
+  ) "--db ${lib.escapeShellArg cfg.environment.BRAIN_DB}";
+  installHooks = ''
+    brainHooks=()
+    ${lib.concatMapStringsSep "\n" chooseAgent agents}
+    if (( ''${#brainHooks[@]} )); then
+      run env PATH=${profileBin}:"$PATH" ${environment} ${lib.getExe cfg.package} ${index} \
+        install --quiet "''${brainHooks[@]}" \
+        || warnEcho "brain: a hook is not set up, as said above; \`brain install --check\` shows them all"
+    fi
+    unset brainHooks
+  '';
 in
 {
   imports =
@@ -84,7 +87,26 @@ in
         "package"
         "pollInterval"
         "environment"
-      ];
+      ]
+    # Claude Code and Codex write their own settings files. Setting their hooks through Home
+    # Manager either replaced those files or made them read-only, so the hooks are left to
+    # `brain install`, which adds them to the files as they are.
+    ++
+      map
+        (
+          name:
+          lib.mkRemovedOptionModule [ "programs" "brain" name ] ''
+            Home Manager no longer writes the agents' settings for brain's hooks. Set
+            `programs.brain.installHooks = true;` instead: at every switch it runs
+            `brain install`, which adds the hook to each agent's own settings and leaves the rest
+            of them alone. See "Agent hooks with Home Manager" in brain's README.
+          ''
+        )
+        [
+          "enableClaudeIntegration"
+          "enableCodexIntegration"
+          "enablePiIntegration"
+        ];
 
   options.programs.brain = {
     enable = lib.mkEnableOption "brain, with continuous indexing of local agent conversation history";
@@ -119,96 +141,71 @@ in
         Environment variables for the watcher, such as CLAUDE_CONFIG_DIR,
         CODEX_HOME, PI_CODING_AGENT_DIR, or BRAIN_DB. Use absolute paths;
         shell variables and tilde are not expanded. Values are stored in the
-        Nix store and must not contain secrets. The integrations follow them
-        too: they find each agent's settings and the index where these say.
+        Nix store and must not contain secrets. `installHooks` uses them too.
       '';
     };
 
-    enableClaudeIntegration = integration "Claude Code" ''
-      With {option}`programs.claude-code.enable`, the SessionStart hook is added to
-      {option}`programs.claude-code.settings`. Otherwise {command}`brain install --claude`
-      adds it to {file}`~/.claude/settings.json` at activation, leaving the rest of that
-      file as it is.
-    '';
+    installHooks = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      example = true;
+      description = ''
+        Whether to run `brain install` at every switch for Claude Code, Codex and Pi: each one
+        Home Manager configures, and each whose directory exists. It adds brain's SessionStart
+        hook to the agent's own settings, or Pi's extension, and changes nothing else in them;
+        it prints only what it changed. The hooks name the profile's `brain`, so they stay as
+        they are across updates, and so does Codex's trust in its hook.
 
-    enableCodexIntegration = integration "Codex" ''
-      With {option}`programs.codex.enable`, the SessionStart hook is added to
-      {option}`programs.codex.hooks` and hooks are turned on in
-      {option}`programs.codex.settings`. Otherwise {command}`brain install --codex` does
-      both in {file}`~/.codex` at activation. Codex runs a new hook only once you trust
-      it: review it with {command}`/hooks` in Codex.
-    '';
-
-    enablePiIntegration = integration "Pi" ''
-      Links brain's extension into {file}`~/.pi/agent/extensions`, or into the
-      directory {option}`programs.pi-coding-agent.configDir` names.
-    '';
+        A settings file Home Manager links from the store cannot be changed: the switch carries
+        on with a warning, and the hook is declared in Nix instead (see brain's README). Turning
+        this off leaves the hooks in place; `brain uninstall --claude --codex --pi` removes them.
+      '';
+    };
   };
 
-  config = lib.mkIf cfg.enable (
-    lib.mkMerge [
+  config = lib.mkIf cfg.enable {
+    assertions = [
       {
-        assertions = [
-          {
-            assertion = pkgs.stdenv.hostPlatform.isLinux;
-            message = "programs.brain requires Linux with a systemd user manager.";
-          }
-          {
-            assertion = lib.all (name: builtins.match "[A-Za-z_][A-Za-z0-9_]*" name != null) (
-              builtins.attrNames cfg.environment
-            );
-            message = "programs.brain.environment must use valid environment variable names.";
-          }
-        ];
-
-        home.packages = [ cfg.package ];
-
-        # Respect an explicit user preference not to start services at activation.
-        systemd.user.startServices = lib.mkDefault "sd-switch";
-        systemd.user.services.brain = {
-          Unit.Description = "Index Claude Code, Codex and Pi conversation history";
-          Service = {
-            ExecStart = "${lib.getExe cfg.package} watch --interval ${toString cfg.pollInterval}";
-            Environment = lib.mapAttrsToList (name: value: quoteEnvironment "${name}=${value}") cfg.environment;
-            Restart = "always";
-            RestartSec = 30;
-            Nice = 10;
-            IOSchedulingClass = "idle";
-          };
-          Install.WantedBy = [ "default.target" ];
-        };
+        assertion = pkgs.stdenv.hostPlatform.isLinux;
+        message = "programs.brain requires Linux with a systemd user manager.";
       }
+      {
+        assertion = lib.all (name: builtins.match "[A-Za-z_][A-Za-z0-9_]*" name != null) (
+          builtins.attrNames cfg.environment
+        );
+        message = "programs.brain.environment must use valid environment variable names.";
+      }
+    ];
 
-      (lib.mkIf cfg.enablePiIntegration {
-        # `force`: a copy that `brain install --pi` left there earlier is brain's own file.
-        home.file."${piDirectory}/extensions/brain-brief.ts" = {
-          source = "${cfg.package}/share/brain/pi/brain-brief.ts";
-          force = true;
-        };
-      })
+    home.packages = [ cfg.package ];
 
-      (lib.mkIf (installed != [ ]) {
-        # A hook that cannot be added must not stop the rest of the activation.
-        home.activation.brainIntegrations = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
-          run env ${
-            lib.escapeShellArgs (lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment)
-          } PATH="${cfg.package}/bin:$PATH" ${lib.escapeShellArgs brain} install --quiet ${toString installed} \
-            || warnEcho "brain: a session-start hook is not set up; see the lines above"
-        '';
-      })
+    # After Home Manager has linked its files, put `brain` in the profile and merged its own
+    # declarations into the agents' mutable settings, which would otherwise replace the
+    # SessionStart list that holds brain's hook. Entries named here that are not there are left
+    # out of the order.
+    home.activation.brainHooks = lib.mkIf cfg.installHooks (
+      lib.hm.dag.entryAfter [
+        "writeBoundary"
+        "linkGeneration"
+        "installPackages"
+        "claudeCodeSettings"
+        "codexMutableSettings"
+      ] installHooks
+    );
 
-      (lib.optionalAttrs (options.programs ? claude-code) {
-        programs.claude-code.settings = lib.mkIf (cfg.enableClaudeIntegration && claudeManaged) {
-          hooks.SessionStart = [ hook ];
-        };
-      })
-
-      (lib.optionalAttrs (options.programs ? codex) {
-        programs.codex = lib.mkIf (cfg.enableCodexIntegration && codexManaged) {
-          hooks.SessionStart = [ hook ];
-          settings.features.hooks = true;
-        };
-      })
-    ]
-  );
+    # Respect an explicit user preference not to start services at activation.
+    systemd.user.startServices = lib.mkDefault "sd-switch";
+    systemd.user.services.brain = {
+      Unit.Description = "Index Claude Code, Codex and Pi conversation history";
+      Service = {
+        ExecStart = "${lib.getExe cfg.package} watch --interval ${toString cfg.pollInterval}";
+        Environment = lib.mapAttrsToList (name: value: quoteEnvironment "${name}=${value}") cfg.environment;
+        Restart = "always";
+        RestartSec = 30;
+        Nice = 10;
+        IOSchedulingClass = "idle";
+      };
+      Install.WantedBy = [ "default.target" ];
+    };
+  };
 }
